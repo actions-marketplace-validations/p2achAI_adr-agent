@@ -1,0 +1,36 @@
+name: "ADR 2.0 Agent Promotion"
+description: "Promote AARs under docs/ to ADRs under docs/adr/, update index.json (agent-friendly)."
+inputs:
+  openai_api_key:
+    description: "OpenAI API key"
+    required: true
+  openai_model:
+    description: "OpenAI model name"
+    required: false
+    default: "gpt-5.1"
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Install dependencies
+      shell: bash
+      run: |
+        pip install --upgrade pip
+        pip install -r "$GITHUB_ACTION_PATH/requirements.txt"
+
+    - name: Generate ADRs from AARs
+      shell: bash
+      env:
+        OPENAI_API_KEY: ${{ inputs.openai_api_key }}
+        OPENAI_MODEL: ${{ inputs.openai_model }}
+        ADR2_REPO_ROOT: ${{ github.workspace }}
+      run: python "$GITHUB_ACTION_PATH/scripts/adr2_agent_action.py"
+
+    - name: Show ADR index
+      if: always()
+      shell: bash
+      run: test -f docs/adr/index.json && cat docs/adr/index.json || echo "index.json not created"
