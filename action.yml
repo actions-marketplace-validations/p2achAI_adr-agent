@@ -9,8 +9,8 @@ inputs:
     required: false
     default: "gpt-5.1"
   github_token:
-    description: "GitHub token for creating PRs (defaults to GITHUB_TOKEN)"
-    required: false
+    description: "GitHub token for creating PRs"
+    required: true
   pr_branch:
     description: "Branch name for ADR auto-PR"
     required: false
