@@ -255,10 +255,13 @@ def render_adr(markup: Dict, body: Dict) -> str:
         "consequences": consequences,
     }
 
+    # Hybrid format: structured front matter + minimal human-readable context body.
     return (
         "---\n"
         f"{yaml.safe_dump(front_matter, sort_keys=False, allow_unicode=True)}"
-        "---\n"
+        "---\n\n"
+        "## Context (for humans)\n"
+        f"{body.get('context', '').strip() or 'N/A'}\n"
     )
 
 
