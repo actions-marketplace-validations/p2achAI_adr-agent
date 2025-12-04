@@ -256,9 +256,10 @@ def render_adr(markup: Dict, body: Dict) -> str:
     }
 
     # Hybrid format: structured front matter + minimal human-readable context body.
+    # Use default_style='"' to ensure all strings are quoted to avoid YAML parsing issues with special chars like @
     return (
         "---\n"
-        f"{yaml.safe_dump(front_matter, sort_keys=False, allow_unicode=True)}"
+        f"{yaml.safe_dump(front_matter, sort_keys=False, allow_unicode=True, default_flow_style=False, width=float('inf'), default_style='\"')}"
         "---\n\n"
         "## Context (for humans)\n"
         f"{body.get('context', '').strip() or 'N/A'}\n"
