@@ -187,5 +187,5 @@ jobs:
 - AAR source files are deleted after processing; back them up elsewhere if you need to keep originals.
 
 ### ADR output (agent-friendly)
-- Front matter only (YAML between `---`): `id`, `scope`, `created_at`, `updated_at`, `decision`, `context`, `rationale`, `alternatives`, `consequences`, `related`, `validation_rules`, `agent_playbook`, `agent_signals`(importance/enforcement), `index_terms`
-- No duplicated markdown body (keeps tokens small and avoids repeated content)
+- Front matter (YAML between `---`): `id`, `scope`, `created_at`, `updated_at`, `decision`, `context`, `rationale`, `alternatives`, `consequences`, `related`, `validation_rules`, `agent_playbook`, `agent_signals`(importance/enforcement), `index_terms`
+- Body: `## Context (for humans)` with the same context text (minimal human-readable section)
