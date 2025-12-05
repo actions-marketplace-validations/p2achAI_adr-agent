@@ -26,6 +26,34 @@ from typing import Dict, List, Tuple
 import yaml
 from openai import OpenAI, OpenAIError
 
+
+class SafeYAMLDumper(yaml.SafeDumper):
+    """Custom YAML dumper that safely handles special characters (@, :, #, {}, [], etc.)."""
+    pass
+
+
+# Pre-compile constants for performance
+_YAML_SPECIAL_CHARS = frozenset(['@', ':', '#', '{', '}', '[', ']', '!', '&', '*', '?', '%', '>', '|'])
+
+
+def str_representer(dumper, data):
+    """Force quoting on strings to avoid YAML parsing issues with special characters."""
+    if not data:
+        return dumper.represent_scalar('tag:yaml.org,2002:str', data, style='"')
+    if '\n' in data:
+        return dumper.represent_scalar('tag:yaml.org,2002:str', data, style='|')
+    # Fast path: check first char and whitespace (most common cases)
+    if data[0] in _YAML_SPECIAL_CHARS or data != data.strip():
+        return dumper.represent_scalar('tag:yaml.org,2002:str', data, style='"')
+    # Check for @ and # anywhere in string (common problematic chars)
+    if '@' in data or '#' in data:
+        return dumper.represent_scalar('tag:yaml.org,2002:str', data, style='"')
+    return dumper.represent_scalar('tag:yaml.org,2002:str', data, style='"')
+
+
+SafeYAMLDumper.add_representer(str, str_representer)
+
+
 ACTION_ROOT = Path(__file__).resolve().parents[1]
 ROOT = Path(os.getenv("ADR2_REPO_ROOT") or Path.cwd()).resolve()
 DOCS_DIR = ROOT / "docs"
@@ -256,10 +284,26 @@ def render_adr(markup: Dict, body: Dict) -> str:
     }
 
     # Hybrid format: structured front matter + minimal human-readable context body.
-    # Use default_style='"' to ensure all strings are quoted to avoid YAML parsing issues with special chars like @
+    yaml_output = yaml.dump(
+        front_matter,
+        Dumper=SafeYAMLDumper,
+        sort_keys=False,
+        allow_unicode=True,
+        default_flow_style=False,
+        width=float('inf')
+    )
+
+    # Validate round-trip to ensure YAML can be parsed back correctly.
+    try:
+        parsed = yaml.safe_load(yaml_output)
+        if parsed != front_matter:
+            log("WARNING: YAML round-trip validation failed. Data may be corrupted.")
+    except yaml.YAMLError as e:
+        log(f"WARNING: Generated YAML cannot be parsed: {e}")
+
     return (
         "---\n"
-        f"{yaml.safe_dump(front_matter, sort_keys=False, allow_unicode=True, default_flow_style=False, width=float('inf'), default_style='\"')}"
+        f"{yaml_output}"
         "---\n\n"
         "## Context (for humans)\n"
         f"{body.get('context', '').strip() or 'N/A'}\n"
