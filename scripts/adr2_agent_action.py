@@ -176,8 +176,16 @@ def detect_candidates(prompts: Dict[str, str]) -> Tuple[List[Tuple[Path, Dict]],
     system_prompt = f"{CONTEXT_PRIMER}\n\n{prompts['candidate']}"
     for path in aar_paths:
         detection = call_openai_json(system_prompt, read_file(path))
-        if detection.get("isCandidate"):
-            log(f"Candidate detected: {path} (scope={detection.get('decisionScope')})")
+        is_candidate = bool(detection.get("isCandidate"))
+        decision_scope = (detection.get("decisionScope") or "").strip()
+        # Extra safety: never promote "minor-change" even if the model says isCandidate=true.
+        if is_candidate and decision_scope == "minor-change":
+            log(f"Rejected minor-change candidate: {path}")
+            non_candidates.append(path)
+            continue
+
+        if is_candidate:
+            log(f"Candidate detected: {path} (scope={decision_scope or detection.get('decisionScope')})")
             candidates.append((path, detection))
         else:
             log(f"Non-candidate: {path}")
