@@ -12,6 +12,8 @@ Rules must:
 - Describe patterns, boundaries, technology choices, or invariants.
 - Be general enough to apply across the repository.
 
-Output as a JSON array of rules:
+Respond ONLY with a JSON object in this exact shape:
 
-["rule 1", "rule 2", ...]
+{
+  "rules": ["rule 1", "rule 2", ...]
+}
