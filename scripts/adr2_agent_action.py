@@ -12,6 +12,7 @@ Requirements:
 - OPENAI_API_KEY must be available in the environment.
 - Optionally set OPENAI_MODEL (defaults to gpt-5.1).
 """
+
 from __future__ import annotations
 
 import json
@@ -21,7 +22,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import yaml
 from openai import OpenAI, OpenAIError
@@ -29,26 +30,29 @@ from openai import OpenAI, OpenAIError
 
 class SafeYAMLDumper(yaml.SafeDumper):
     """Custom YAML dumper that safely handles special characters (@, :, #, {}, [], etc.)."""
+
     pass
 
 
 # Pre-compile constants for performance
-_YAML_SPECIAL_CHARS = frozenset(['@', ':', '#', '{', '}', '[', ']', '!', '&', '*', '?', '%', '>', '|'])
+_YAML_SPECIAL_CHARS = frozenset(
+    ["@", ":", "#", "{", "}", "[", "]", "!", "&", "*", "?", "%", ">", "|"]
+)
 
 
 def str_representer(dumper, data):
     """Force quoting on strings to avoid YAML parsing issues with special characters."""
     if not data:
-        return dumper.represent_scalar('tag:yaml.org,2002:str', data, style='"')
-    if '\n' in data:
-        return dumper.represent_scalar('tag:yaml.org,2002:str', data, style='|')
+        return dumper.represent_scalar("tag:yaml.org,2002:str", data, style='"')
+    if "\n" in data:
+        return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="|")
     # Fast path: check first char and whitespace (most common cases)
     if data[0] in _YAML_SPECIAL_CHARS or data != data.strip():
-        return dumper.represent_scalar('tag:yaml.org,2002:str', data, style='"')
+        return dumper.represent_scalar("tag:yaml.org,2002:str", data, style='"')
     # Check for @ and # anywhere in string (common problematic chars)
-    if '@' in data or '#' in data:
-        return dumper.represent_scalar('tag:yaml.org,2002:str', data, style='"')
-    return dumper.represent_scalar('tag:yaml.org,2002:str', data, style='"')
+    if "@" in data or "#" in data:
+        return dumper.represent_scalar("tag:yaml.org,2002:str", data, style='"')
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data, style='"')
 
 
 SafeYAMLDumper.add_representer(str, str_representer)
@@ -63,18 +67,15 @@ INDEX_PATH = ADR_DIR / "index.json"
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.1")
 DEFAULT_LANGUAGE = os.getenv("ADR2_LANGUAGE", "en")
 
-# Brief context primer for LLMs so they understand ADR 2.0 vs AAR.
-CONTEXT_PRIMER = """
-You are working with ADR 2.0:
-- AAR (Agent Analysis Record): natural-language reasoning stored under docs/ (except docs/adr/). Describes why a change was made; no code/diffs.
-- ADR (Architecture Decision Record): formal, machine-readable decision doc stored under docs/adr/. Contains scope, decision, rationale, alternatives, consequences, validation rules, agent signals (importance, enforcement level), timestamps. Used by agents/CI to enforce architecture.
-- Goal: promote only architectural decisions from AARs into ADRs, produce agent-friendly, succinct, declarative outputs.
-""".strip()
-
 
 def log(msg: str) -> None:
     print(f"[adr2] {msg}")
     sys.stdout.flush()
+
+
+MAX_MODEL_ATTEMPTS = 2
+PLANNER_MODEL = DEFAULT_MODEL
+GPT5_REASONING_EFFORT = "medium"
 
 
 def slugify(title: str) -> str:
@@ -113,6 +114,7 @@ def load_prompts() -> Dict[str, str]:
     prompts = {}
     search_roots = [ROOT, ACTION_ROOT]
     names = {
+        "adr2": "README.md",
         "candidate": "adr-candidate-detect-prompt.md",
         "generate": "adr-generate-prompt.md",
         "rules": "validate-rule-prompt.md",
@@ -134,28 +136,184 @@ class ADRCandidate:
     adr_payload: Dict
 
 
-def call_openai_json(system_prompt: str, user_content: str, model: str = DEFAULT_MODEL) -> Dict:
-    client = OpenAI()
+_OPENAI_CLIENT: OpenAI | None = None
+
+
+def get_openai_client() -> OpenAI:
+    global _OPENAI_CLIENT
+    if _OPENAI_CLIENT is None:
+        _OPENAI_CLIENT = OpenAI()
+    return _OPENAI_CLIENT
+
+
+def _strip_code_fences(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    return text.strip()
+
+
+def parse_json_from_text(text: str) -> Any:
+    text = _strip_code_fences(text)
     try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content},
-            ],
-            response_format={"type": "json_object"},
-        )
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Best-effort extraction when the model wraps JSON in extra prose.
+    for pattern in (r"\{.*\}", r"\[.*\]"):
+        match = re.search(pattern, text, re.S)
+        if match:
+            return json.loads(match.group(0))
+    raise json.JSONDecodeError("No JSON found", text, 0)
+
+
+def call_openai_text(
+    *,
+    model: str,
+    messages: List[Dict[str, str]],
+    response_format: Dict | None = None,
+    instructions: str | None = None,
+) -> str:
+    client = get_openai_client()
+    try:
+        # Prefer Responses API (needed for reasoning.effort on GPT-5.x).
+        if hasattr(client, "responses"):
+            kwargs: Dict[str, Any] = {"model": model, "input": messages}
+            if instructions:
+                kwargs["instructions"] = instructions
+            if response_format is not None:
+                # JSON mode (ensures valid JSON object output when the prompt requests it).
+                if response_format.get("type") == "json_object":
+                    kwargs["text"] = {"format": {"type": "json_object"}}
+
+            if model.startswith("gpt-5.1"):
+                kwargs["reasoning"] = {"effort": GPT5_REASONING_EFFORT}
+
+            resp = client.responses.create(**kwargs)
+            return getattr(resp, "output_text", "") or ""
+
+        # Fallback for older SDKs that don't have Responses API.
+        kwargs = {}
+        if instructions:
+            # Fold instructions into the first system message for ChatCompletions.
+            if messages and messages[0].get("role") == "system":
+                messages = [
+                    {
+                        "role": "system",
+                        "content": f"{instructions}\n\n{messages[0].get('content','')}".strip(),
+                    },
+                    *messages[1:],
+                ]
+            else:
+                messages = [{"role": "system", "content": instructions}, *messages]
+        if response_format is not None:
+            kwargs["response_format"] = response_format
+        response = client.chat.completions.create(model=model, messages=messages, **kwargs)
     except OpenAIError as exc:
         raise RuntimeError(f"OpenAI API call failed: {exc}") from exc
-
-    content = response.choices[0].message.content or "{}"
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Failed to parse JSON from model response: {content}") from exc
+    return response.choices[0].message.content or ""
 
 
-def detect_candidates(prompts: Dict[str, str]) -> Tuple[List[Tuple[Path, Dict]], List[Path]]:
+def call_openai_json_object(
+    system_prompt: str,
+    user_content: str,
+    model: str = DEFAULT_MODEL,
+    *,
+    instructions: str | None = None,
+) -> Dict[str, Any]:
+    base_messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+    last_content = ""
+    for attempt in range(MAX_MODEL_ATTEMPTS):
+        messages = list(base_messages)
+        if attempt > 0:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "Your previous reply was not valid JSON. Return ONLY a valid JSON object.",
+                }
+            )
+        last_content = call_openai_text(
+            model=model,
+            messages=messages,
+            response_format={"type": "json_object"},
+            instructions=instructions,
+        )
+        try:
+            parsed = parse_json_from_text(last_content)
+            if not isinstance(parsed, dict):
+                raise RuntimeError(
+                    f"Expected JSON object but got {type(parsed).__name__}"
+                )
+            return parsed
+        except Exception:
+            if attempt == MAX_MODEL_ATTEMPTS - 1:
+                raise RuntimeError(
+                    f"Failed to parse JSON object from model response: {last_content}"
+                )
+    return {}
+
+
+def call_openai_json_value(
+    system_prompt: str,
+    user_content: str,
+    model: str = DEFAULT_MODEL,
+    *,
+    instructions: str | None = None,
+) -> Any:
+    base_messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+    last_content = ""
+    for attempt in range(MAX_MODEL_ATTEMPTS):
+        messages = list(base_messages)
+        if attempt > 0:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "Return ONLY valid JSON (no prose, no markdown).",
+                }
+            )
+        last_content = call_openai_text(
+            model=model, messages=messages, instructions=instructions
+        )
+        try:
+            return parse_json_from_text(last_content)
+        except Exception:
+            if attempt == MAX_MODEL_ATTEMPTS - 1:
+                raise RuntimeError(
+                    f"Failed to parse JSON from model response: {last_content}"
+                )
+    return None
+
+
+def maybe_add_agentic_working_notes(aar_text: str) -> str:
+    """멀티패스(선-분석 후-생성)로 모델 추론을 유도."""
+
+    planner_system = (
+        "You are a careful analyst. Read the AAR and produce compact working notes as JSON.\n"
+        "Return ONLY a JSON object with keys: "
+        '["summary","explicit_decisions","constraints","alternatives","consequences","validation_rule_candidates"].\n'
+        "Each value must be a string or array of short strings. Be conservative; omit uncertain items."
+    )
+    notes = call_openai_json_object(planner_system, aar_text, model=PLANNER_MODEL)
+    notes_json = json.dumps(notes, ensure_ascii=False, indent=2)
+    return (
+        f"{aar_text}\n\n"
+        "----\n"
+        "WORKING_NOTES_JSON (for your internal reasoning; do not repeat verbatim):\n"
+        f"{notes_json}\n"
+    )
+
+
+def detect_candidates(
+    prompts: Dict[str, str],
+) -> Tuple[List[Tuple[Path, Dict]], List[Path]]:
     aar_paths = []
     if DOCS_DIR.exists():
         for path in DOCS_DIR.rglob("*.md"):
@@ -173,9 +331,15 @@ def detect_candidates(prompts: Dict[str, str]) -> Tuple[List[Tuple[Path, Dict]],
 
     candidates = []
     non_candidates = []
-    system_prompt = f"{CONTEXT_PRIMER}\n\n{prompts['candidate']}"
+    instructions = prompts.get("adr2", "")
+    system_prompt = prompts["candidate"]
     for path in aar_paths:
-        detection = call_openai_json(system_prompt, read_file(path))
+        aar_text = read_file(path)
+        detection = call_openai_json_object(
+            system_prompt,
+            maybe_add_agentic_working_notes(aar_text),
+            instructions=instructions,
+        )
         is_candidate = bool(detection.get("isCandidate"))
         decision_scope = (detection.get("decisionScope") or "").strip()
         # Extra safety: never promote "minor-change" even if the model says isCandidate=true.
@@ -185,7 +349,9 @@ def detect_candidates(prompts: Dict[str, str]) -> Tuple[List[Tuple[Path, Dict]],
             continue
 
         if is_candidate:
-            log(f"Candidate detected: {path} (scope={decision_scope or detection.get('decisionScope')})")
+            log(
+                f"Candidate detected: {path} (scope={decision_scope or detection.get('decisionScope')})"
+            )
             candidates.append((path, detection))
         else:
             log(f"Non-candidate: {path}")
@@ -195,13 +361,15 @@ def detect_candidates(prompts: Dict[str, str]) -> Tuple[List[Tuple[Path, Dict]],
 
 def build_generator_prompt(prompts: Dict[str, str]) -> str:
     language_hint = f"Write the ADR in {DEFAULT_LANGUAGE}."
-    base = f"{CONTEXT_PRIMER}\n\n{language_hint}\n\n{prompts.get('generate', '')}".strip()
+    base = (
+        f"{language_hint}\n\n{prompts.get('generate', '')}".strip()
+    )
     schema_hint = (
         "Return ONLY a JSON object with keys:"
         ' {"title","scope","decision","context","rationale",'
         '"alternatives","consequences","validation_rules","agent_playbook",'
         '"agent_signals","related_suggestions","index_terms"}. '
-        'Use short, declarative language for agents. '
+        "Use short, declarative language for agents. "
         'Scope must be one of ["architecture","infrastructure","data-model","api","component"]. '
         "Alternatives and consequences must be arrays. "
         "Validation rules must be an array of declarative constraints. "
@@ -214,18 +382,77 @@ def build_generator_prompt(prompts: Dict[str, str]) -> str:
     return f"{base}\n\n{schema_hint}".strip()
 
 
-def generate_adr_payload(prompts: Dict[str, str], aar_text: str, scope_hint: str) -> Dict:
+def generate_adr_payload(
+    prompts: Dict[str, str], aar_text: str, scope_hint: str
+) -> Dict:
     system_prompt = build_generator_prompt(prompts)
-    payload = call_openai_json(system_prompt, aar_text)
+    instructions = prompts.get("adr2", "")
+    payload = call_openai_json_object(
+        system_prompt,
+        maybe_add_agentic_working_notes(aar_text),
+        instructions=instructions,
+    )
     payload.setdefault("scope", scope_hint or "architecture")
     payload.setdefault("alternatives", [])
     payload.setdefault("consequences", [])
     payload.setdefault("validation_rules", [])
     payload.setdefault("agent_playbook", [])
-    payload.setdefault("agent_signals", {"importance": "medium", "enforcement": "should"})
+    payload.setdefault(
+        "agent_signals", {"importance": "medium", "enforcement": "should"}
+    )
     payload.setdefault("related_suggestions", [])
     payload.setdefault("index_terms", [])
     return payload
+
+
+def normalize_string_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+    if isinstance(value, str):
+        v = value.strip()
+        return [v] if v else []
+    return [str(value).strip()]
+
+
+def maybe_enrich_validation_rules(prompts: Dict[str, str], payload: Dict[str, Any]) -> None:
+    """
+    - 생성된 ADR의 핵심 텍스트로부터 추가 validation_rules를 추출해 병합.
+    """
+    rules_prompt = prompts.get("rules")
+    if not rules_prompt:
+        return
+    instructions = prompts.get("adr2", "")
+
+    seed_text = "\n\n".join(
+        [
+            f"Title: {payload.get('title','')}",
+            f"Decision: {payload.get('decision','')}",
+            f"Context: {payload.get('context','')}",
+            f"Rationale: {payload.get('rationale','')}",
+        ]
+    ).strip()
+    if not seed_text:
+        return
+
+    extracted_obj = call_openai_json_object(
+        rules_prompt, seed_text, instructions=instructions
+    )
+    extracted = extracted_obj.get("rules")
+    if not isinstance(extracted, list):
+        return
+
+    existing = normalize_string_list(payload.get("validation_rules"))
+    additional = normalize_string_list(extracted)
+    merged: List[str] = []
+    seen: set[str] = set()
+    for rule in existing + additional:
+        key = rule.lower()
+        if key not in seen:
+            seen.add(key)
+            merged.append(rule)
+    payload["validation_rules"] = merged
 
 
 def resolve_related(suggestions: List[str], catalog: List[Dict]) -> List[str]:
@@ -262,12 +489,25 @@ def render_adr(markup: Dict, body: Dict) -> str:
     consequences = body.get("consequences") or []
     validation_rules = markup.get("validation_rules") or []
     agent_playbook = markup.get("agent_playbook") or []
-    agent_signals = markup.get("agent_signals") or {"importance": "medium", "enforcement": "should"}
+    agent_signals = markup.get("agent_signals") or {
+        "importance": "medium",
+        "enforcement": "should",
+    }
 
-    alternatives_block = "\n".join(f"- {item}" for item in alternatives) or "- None recorded."
-    consequences_block = "\n".join(f"- {item}" for item in consequences) or "- Not documented."
-    validation_block = "\n".join(f"- {item}" for item in validation_rules) or "- No validation rules captured."
-    playbook_block = "\n".join(f"- {item}" for item in agent_playbook) or "- No agent playbook provided."
+    alternatives_block = (
+        "\n".join(f"- {item}" for item in alternatives) or "- None recorded."
+    )
+    consequences_block = (
+        "\n".join(f"- {item}" for item in consequences) or "- Not documented."
+    )
+    validation_block = (
+        "\n".join(f"- {item}" for item in validation_rules)
+        or "- No validation rules captured."
+    )
+    playbook_block = (
+        "\n".join(f"- {item}" for item in agent_playbook)
+        or "- No agent playbook provided."
+    )
     signals_block = f"- Importance: {agent_signals.get('importance', 'medium')}\n- Enforcement: {agent_signals.get('enforcement', 'should')}"
 
     index_terms = markup.get("index_terms") or []
@@ -298,7 +538,7 @@ def render_adr(markup: Dict, body: Dict) -> str:
         sort_keys=False,
         allow_unicode=True,
         default_flow_style=False,
-        width=float('inf')
+        width=float("inf"),
     )
 
     # Validate round-trip to ensure YAML can be parsed back correctly.
@@ -386,9 +626,12 @@ def main() -> None:
         raise SystemExit("OPENAI_API_KEY is required.")
 
     prompts = load_prompts()
+    if "adr2" not in prompts:
+        raise SystemExit("README.md prompt (adr2) is required.")
     log(f"Repo root: {ROOT}")
     log(f"Using model: {DEFAULT_MODEL}")
     log(f"Language: {DEFAULT_LANGUAGE}")
+    log("Agentic reasoning: on")
     catalog = catalog_existing_adrs()
     log(f"Loaded catalog with {len(catalog)} existing ADR(s).")
 
@@ -410,13 +653,23 @@ def main() -> None:
         scope_hint = detection.get("decisionScope", "architecture")
         aar_text = read_file(path)
         payload = generate_adr_payload(prompts, aar_text, scope_hint)
+        maybe_enrich_validation_rules(prompts, payload)
+        payload["alternatives"] = normalize_string_list(payload.get("alternatives"))
+        payload["consequences"] = normalize_string_list(payload.get("consequences"))
+        payload["validation_rules"] = normalize_string_list(payload.get("validation_rules"))
+        payload["agent_playbook"] = normalize_string_list(payload.get("agent_playbook"))
+        payload["index_terms"] = normalize_string_list(payload.get("index_terms"))
+        if not isinstance(payload.get("agent_signals"), dict):
+            payload["agent_signals"] = {"importance": "medium", "enforcement": "should"}
 
         adr_id = next_adr_id(catalog + new_catalog_entries)
         slug = slugify(payload.get("title", adr_id))
         adr_filename = f"{adr_id}-{slug}.md"
         adr_path = ADR_DIR / adr_filename
 
-        related_ids = resolve_related(payload.get("related_suggestions", []), catalog + new_catalog_entries)
+        related_ids = resolve_related(
+            payload.get("related_suggestions", []), catalog + new_catalog_entries
+        )
 
         markup = {
             "id": adr_id,
@@ -428,7 +681,9 @@ def main() -> None:
             "related": related_ids,
             "validation_rules": payload.get("validation_rules", []),
             "agent_playbook": payload.get("agent_playbook", []),
-            "agent_signals": payload.get("agent_signals", {"importance": "medium", "enforcement": "should"}),
+            "agent_signals": payload.get(
+                "agent_signals", {"importance": "medium", "enforcement": "should"}
+            ),
             "index_terms": payload.get("index_terms", []),
         }
 
