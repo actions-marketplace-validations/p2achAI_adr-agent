@@ -100,12 +100,77 @@ def write_file(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+def _quote_yaml_scalar(value: str) -> str:
+    if '"' not in value:
+        return f'"{value}"'
+    if "'" not in value:
+        return f"'{value}'"
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _sanitize_front_matter(raw: str) -> str:
+    lines = raw.splitlines()
+    sanitized: List[str] = []
+    in_block = False
+    block_indent = 0
+    key_line_re = re.compile(r"^(\s*)([A-Za-z0-9_-]+)\s*:\s*(.*)$")
+
+    for line in lines:
+        if in_block:
+            if line.strip() == "":
+                sanitized.append(line)
+                continue
+            indent = len(line) - len(line.lstrip(" "))
+            if indent > block_indent:
+                sanitized.append(line)
+                continue
+            in_block = False
+
+        match = key_line_re.match(line)
+        if not match:
+            sanitized.append(line)
+            continue
+
+        indent, key, value = match.groups()
+        value = value.strip()
+        if value == "":
+            sanitized.append(line)
+            continue
+        if value.startswith(("|", ">")):
+            in_block = True
+            block_indent = len(indent)
+            sanitized.append(line)
+            continue
+        if value.startswith(('"', "'", "[", "{", "&", "*", "!", "@")):
+            sanitized.append(line)
+            continue
+
+        if ": " in value:
+            quoted = _quote_yaml_scalar(value)
+            sanitized.append(f"{indent}{key}: {quoted}")
+            continue
+
+        sanitized.append(line)
+
+    return "\n".join(sanitized)
+
+
 def parse_front_matter(path: Path) -> Tuple[Dict, str]:
     text = read_file(path)
     match = re.match(r"---\s*\n(.*?)\n---\s*\n?(.*)", text, re.S)
     if not match:
         return {}, text
-    front_matter = yaml.safe_load(match.group(1)) or {}
+    try:
+        front_matter = yaml.safe_load(match.group(1)) or {}
+    except yaml.YAMLError as exc:
+        sanitized = _sanitize_front_matter(match.group(1))
+        try:
+            front_matter = yaml.safe_load(sanitized) or {}
+            log(f"WARNING: Sanitized front matter in {path} after YAML error: {exc}")
+        except yaml.YAMLError as exc2:
+            log(f"WARNING: Failed to parse front matter in {path}: {exc2}")
+            return {}, text
     body = match.group(2)
     return front_matter, body
 
