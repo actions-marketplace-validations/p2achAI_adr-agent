@@ -27,7 +27,7 @@ Characteristics:
 * High-level conceptual reasoning
 * Explains **why** a change was made
 * Does **not** include code or diffs
-* Stored anywhere under `docs/`, except `docs/adr/`
+* Stored only under `docs/aar/`
 * Serves as raw material for ADR creation
 
 ---
@@ -126,7 +126,7 @@ ADR 2.0 is the natural evolution of architecture documentation in an AI-native d
 
 ### Summary
 - Name: ADR 2.0 Agent Promotion
-- Purpose: detect AARs under `docs/`, promote to ADRs under `docs/adr/ADR-XXXX-*.md`, update `docs/adr/index.json`, and clean up processed AARs
+- Purpose: detect AARs under `docs/aar/`, promote to ADRs under `docs/adr/ADR-XXXX-*.md`, update `docs/adr/index.json`, and clean up processed AARs
 - Features: agent-friendly template (Agent Playbook, Agent Signals, Validation Rules), slim index, progress logs, automatic AAR cleanup
 
 ### Inputs
@@ -153,7 +153,7 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - "docs/**"
+      - "docs/aar/**"
 
 permissions:
   contents: write
@@ -173,7 +173,7 @@ jobs:
 ```
 
 ### Flow
-1) Scan `docs/` (skip `docs/adr/`) → detect candidates  
+1) Scan `docs/aar/` → detect candidates  
 2) Generate ADRs (`docs/adr/ADR-XXXX-<slug>.md` with front matter `id/scope/created_at/updated_at/decision/context/rationale/alternatives/consequences/related/validation_rules/agent_playbook/agent_signals/index_terms`)  
 3) Update slim `docs/adr/index.json` (with `decision_summary`)  
 4) Delete promoted AARs and non-candidates  
@@ -184,7 +184,7 @@ jobs:
 - `ADR2_REPO_ROOT` is auto-set to `github.workspace` so the action runs against the calling repo.
 
 ### Caution
-- AAR source files are deleted after processing; back them up elsewhere if you need to keep originals.
+- AAR source files under `docs/aar/` are deleted after processing; back them up elsewhere if you need to keep originals.
 
 ### ADR output (agent-friendly)
 - Front matter (YAML between `---`): `id`, `scope`, `created_at`, `updated_at`, `decision`, `context`, `rationale`, `alternatives`, `consequences`, `related`, `validation_rules`, `agent_playbook`, `agent_signals`(importance/enforcement), `index_terms`

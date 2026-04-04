@@ -1,5 +1,5 @@
 name: "ADR 2.0 Agent Promotion"
-description: "Promote AARs under docs/ to ADRs under docs/adr/, update index.json (agent-friendly)."
+description: "Promote AARs under docs/aar/ to ADRs under docs/adr/, update index.json (agent-friendly)."
 inputs:
   openai_api_key:
     description: "OpenAI API key"

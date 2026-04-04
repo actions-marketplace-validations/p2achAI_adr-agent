@@ -3,7 +3,7 @@
 ADR 2.0 agent-focused promotion script.
 
 This script is meant to be run inside CI (GitHub Actions) to:
-- Scan docs/ for AAR files (excluding docs/adr/)
+- Scan docs/aar/ for AAR files
 - Detect AARs that should be promoted to ADRs
 - Generate agent-friendly ADR markdown with structured front matter
 - Maintain docs/adr/index.json so agents can quickly locate relevant ADRs
@@ -62,6 +62,7 @@ ACTION_ROOT = Path(__file__).resolve().parents[1]
 ROOT = Path(os.getenv("ADR2_REPO_ROOT") or Path.cwd()).resolve()
 DOCS_DIR = ROOT / "docs"
 ADR_DIR = DOCS_DIR / "adr"
+AAR_DIR = DOCS_DIR / "aar"
 INDEX_PATH = ADR_DIR / "index.json"
 
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.1")
@@ -380,13 +381,14 @@ def detect_candidates(
     prompts: Dict[str, str],
 ) -> Tuple[List[Tuple[Path, Dict]], List[Path]]:
     aar_paths = []
-    if DOCS_DIR.exists():
-        for path in DOCS_DIR.rglob("*.md"):
-            if ADR_DIR in path.parents:
-                continue
+    if AAR_DIR.exists():
+        for path in AAR_DIR.rglob("*.md"):
             aar_paths.append(path)
+    else:
+        log("docs/aar not found; skipping AAR scan.")
+        return [], []
 
-    log(f"Discovered {len(aar_paths)} AAR markdown file(s) under docs/.")
+    log(f"Discovered {len(aar_paths)} AAR markdown file(s) under docs/aar/.")
 
     if not aar_paths:
         return [], []
