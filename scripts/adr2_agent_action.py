@@ -16,6 +16,7 @@ Requirements:
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -23,7 +24,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
 
 import anthropic
 import yaml
@@ -82,6 +83,28 @@ VALID_DECISION_SCOPES = {
     "developer-platform",
     "minor-change",
 }
+
+# ADR front matter `scope` values the generator is allowed to emit. The prompt
+# alone never held this contract, so new ADRs are coerced in code.
+VALID_ADR_SCOPES = (
+    "architecture",
+    "infrastructure",
+    "data-model",
+    "api",
+    "component",
+)
+DEFAULT_ADR_SCOPE = "architecture"
+
+# Domain taxonomy: routing axis for the ADR tree index. `scope` is far too
+# coarse to route on, so domains are curated per docs dir and validated here.
+DOMAINS_FILENAME = "domains.yml"
+TREE_FILENAME = "tree.json"
+UNCLASSIFIED_DOMAIN = "unclassified"
+
+# Agents load the tree root first, so it must stay small enough to be cheap.
+ROOT_PAYLOAD_LIMIT_BYTES = 5120
+DOMAIN_SUMMARY_LIMIT = 200
+LEAF_SUMMARY_LIMIT = 120
 
 
 def log(msg: str) -> None:
@@ -172,6 +195,16 @@ def _sanitize_front_matter(raw: str) -> str:
     return "\n".join(sanitized)
 
 
+# Populated by parse_front_matter() whenever a docs/adr/*.md file has a
+# ``---\n...\n---`` front matter block that cannot be parsed as YAML, even
+# after sanitization. main() surfaces this list and fails loudly instead of
+# silently dropping the ADR from the generated index, which is what used to
+# happen (ADR-0001 disappeared from the backend index this way). Files with
+# no front matter block at all (e.g. a plain docs/adr/README.md) are not
+# treated as failures -- they are simply not ADR files.
+PARSE_FAILURES: List[Tuple[Path, str]] = []
+
+
 def parse_front_matter(path: Path) -> Tuple[Dict, str]:
     text = read_file(path)
     match = re.match(r"---\s*\n(.*?)\n---\s*\n?(.*)", text, re.S)
@@ -183,9 +216,11 @@ def parse_front_matter(path: Path) -> Tuple[Dict, str]:
         sanitized = _sanitize_front_matter(match.group(1))
         try:
             front_matter = yaml.safe_load(sanitized) or {}
-            log(f"WARNING: Sanitized front matter in {path} after YAML error: {exc}")
+            log(f"WARNING: Sanitized front matter in {display_path(path)} after YAML error: {exc}")
         except yaml.YAMLError as exc2:
-            log(f"WARNING: Failed to parse front matter in {path}: {exc2}")
+            reason = str(exc2).splitlines()[0]
+            PARSE_FAILURES.append((path, reason))
+            log(f"ERROR: Failed to parse front matter in {display_path(path)}: {reason}")
             return {}, text
     body = match.group(2)
     return front_matter, body
@@ -223,6 +258,16 @@ class DocsContext:
     aar_dir: Path
     adr_dir: Path
     index_path: Path
+    tree_path: Path
+    domains_path: Path
+
+
+@dataclass(frozen=True)
+class Domain:
+    key: str
+    label: str
+    match_terms: Tuple[str, ...]
+    parent: str | None
 
 
 def _split_path_list(value: str) -> List[str]:
@@ -258,9 +303,142 @@ def resolve_docs_contexts() -> List[DocsContext]:
                 aar_dir=docs_dir / "aar",
                 adr_dir=docs_dir / "adr",
                 index_path=docs_dir / "adr" / "index.json",
+                tree_path=docs_dir / "adr" / TREE_FILENAME,
+                domains_path=docs_dir / "adr" / DOMAINS_FILENAME,
             )
         )
     return contexts
+
+
+def load_domains(context: DocsContext) -> List[Domain]:
+    """Load the curated domain taxonomy for a docs dir.
+
+    A missing file disables domain classification and tree generation for that
+    docs dir, keeping the previous behaviour intact.
+    """
+    if not context.domains_path.exists():
+        return []
+
+    try:
+        raw = yaml.safe_load(read_file(context.domains_path)) or {}
+    except yaml.YAMLError as exc:
+        log(f"WARNING: Failed to parse {display_path(context.domains_path)}: {exc}")
+        return []
+
+    entries = raw.get("domains") if isinstance(raw, dict) else raw
+    if not isinstance(entries, list):
+        log(f"WARNING: {display_path(context.domains_path)} has no 'domains' list.")
+        return []
+
+    domains: List[Domain] = []
+    seen: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        key = str(entry.get("key", "")).strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        domains.append(
+            Domain(
+                key=key,
+                label=str(entry.get("label") or key).strip(),
+                match_terms=tuple(normalize_string_list(entry.get("match_terms"))),
+                parent=(str(entry.get("parent")).strip() or None)
+                if entry.get("parent")
+                else None,
+            )
+        )
+
+    known = {domain.key for domain in domains}
+    for domain in domains:
+        if domain.parent and domain.parent not in known:
+            log(
+                f"WARNING: domain '{domain.key}' references unknown parent "
+                f"'{domain.parent}' in {display_path(context.domains_path)}."
+            )
+    return domains
+
+
+def normalize_domain(value: Any, domains: Iterable[Domain]) -> str | None:
+    """Accept a domain value only when it exists in the taxonomy."""
+    if not value:
+        return None
+    candidate = str(value).strip().lower()
+    if not candidate:
+        return None
+    for domain in domains:
+        if domain.key.lower() == candidate:
+            return domain.key
+    return None
+
+
+def _domain_haystack(record: Dict[str, Any]) -> str:
+    parts = [
+        stringify(record.get("title")),
+        stringify(record.get("index_terms")),
+        stringify(record.get("path")),
+        stringify(record.get("decision")),
+    ]
+    return " ".join(part for part in parts if part).lower()
+
+
+def match_domain_by_terms(
+    record: Dict[str, Any], domains: Iterable[Domain]
+) -> str | None:
+    """Deterministic fallback classification based on curated match terms."""
+    haystack = _domain_haystack(record)
+    if not haystack:
+        return None
+
+    best_key: str | None = None
+    best_score = 0
+    for domain in domains:
+        score = 0
+        for term in domain.match_terms:
+            needle = term.strip().lower()
+            if needle and needle in haystack:
+                score += 1
+        # Ties resolve to the first taxonomy entry, keeping output deterministic.
+        if score > best_score:
+            best_score = score
+            best_key = domain.key
+    return best_key
+
+
+def resolve_domain(
+    record: Dict[str, Any],
+    domains: Iterable[Domain],
+    proposed: Any = None,
+) -> str:
+    """Resolve a domain: validated proposal, then terms, then unclassified."""
+    domains = list(domains)
+    if not domains:
+        return ""
+
+    validated = normalize_domain(proposed, domains)
+    if validated:
+        return validated
+    if proposed:
+        log(
+            f"WARNING: proposed domain {str(proposed)!r} is not in the taxonomy; "
+            "falling back to deterministic matching."
+        )
+
+    matched = match_domain_by_terms(record, domains)
+    return matched or UNCLASSIFIED_DOMAIN
+
+
+def normalize_adr_scope(value: Any) -> str:
+    scope = str(value or "").strip()
+    if scope in VALID_ADR_SCOPES:
+        return scope
+    if scope:
+        log(
+            f"WARNING: scope {scope!r} is outside the allowed set "
+            f"{list(VALID_ADR_SCOPES)}; using {DEFAULT_ADR_SCOPE!r}."
+        )
+    return DEFAULT_ADR_SCOPE
 
 
 _OPENAI_CLIENT: OpenAI | None = None
@@ -845,12 +1023,9 @@ def write_index(catalog: List[Dict], context: DocsContext) -> None:
     write_file(context.index_path, json.dumps(payload, indent=2, ensure_ascii=False))
 
 
-def already_promoted(source_path: Path, catalog: List[Dict]) -> bool:
-    rel = display_path(source_path)
-    return any(entry.get("source") == rel for entry in catalog)
-
-
 def main() -> None:
+    PARSE_FAILURES.clear()
+
     if LLM_PROVIDER == "claude":
         if not os.getenv("ANTHROPIC_API_KEY"):
             raise SystemExit("ANTHROPIC_API_KEY is required when LLM_PROVIDER=claude.")
@@ -876,91 +1051,98 @@ def main() -> None:
         detections, non_candidates = detect_candidates(prompts, context)
         non_candidate_deletions: set[Path] = set()
         candidate_deletions: set[Path] = set()
-        if not detections and not non_candidates:
-            log("No ADR candidates found.")
-            continue
-
-        processed_any = True
         new_catalog_entries: List[Dict] = []
-        for path, detection in detections:
-            if already_promoted(path, catalog):
-                log(f"Skipping already promoted AAR: {path}")
-                # still mark for deletion to avoid reprocessing noise
-                non_candidate_deletions.add(path)
-                continue
 
-            scope_hint = detection.get("decisionScope", "architecture")
-            aar_text = read_file(path)
-            payload = generate_adr_payload(prompts, aar_text, scope_hint)
-            maybe_enrich_validation_rules(prompts, payload)
-            payload["alternatives"] = normalize_string_list(payload.get("alternatives"))
-            payload["consequences"] = normalize_string_list(payload.get("consequences"))
-            payload["validation_rules"] = normalize_string_list(payload.get("validation_rules"))
-            payload["agent_playbook"] = normalize_string_list(payload.get("agent_playbook"))
-            payload["index_terms"] = normalize_string_list(payload.get("index_terms"))
-            if not isinstance(payload.get("agent_signals"), dict):
-                payload["agent_signals"] = {"importance": "medium", "enforcement": "should"}
+        if not detections and not non_candidates:
+            log("No ADR candidates found; index will still be regenerated from disk.")
+        else:
+            processed_any = True
+            for path, detection in detections:
+                scope_hint = detection.get("decisionScope", "architecture")
+                aar_text = read_file(path)
+                payload = generate_adr_payload(prompts, aar_text, scope_hint)
+                maybe_enrich_validation_rules(prompts, payload)
+                payload["alternatives"] = normalize_string_list(payload.get("alternatives"))
+                payload["consequences"] = normalize_string_list(payload.get("consequences"))
+                payload["validation_rules"] = normalize_string_list(payload.get("validation_rules"))
+                payload["agent_playbook"] = normalize_string_list(payload.get("agent_playbook"))
+                payload["index_terms"] = normalize_string_list(payload.get("index_terms"))
+                if not isinstance(payload.get("agent_signals"), dict):
+                    payload["agent_signals"] = {"importance": "medium", "enforcement": "should"}
 
-            adr_id = next_adr_id(catalog + new_catalog_entries)
-            slug = slugify(payload.get("title", adr_id))
-            adr_filename = f"{adr_id}-{slug}.md"
-            adr_path = context.adr_dir / adr_filename
+                adr_id = next_adr_id(catalog + new_catalog_entries)
+                slug = slugify(payload.get("title", adr_id))
+                adr_filename = f"{adr_id}-{slug}.md"
+                adr_path = context.adr_dir / adr_filename
 
-            related_ids = resolve_related(
-                payload.get("related_suggestions", []), catalog + new_catalog_entries
-            )
+                related_ids = resolve_related(
+                    payload.get("related_suggestions", []), catalog + new_catalog_entries
+                )
 
-            markup = {
-                "id": adr_id,
-                "title": payload.get("title", adr_id),
-                "scope": payload.get("scope", scope_hint),
-                "created_at": now_iso(),
-                "updated_at": now_iso(),
-                "decision": payload.get("decision", "").strip(),
-                "related": related_ids,
-                "validation_rules": payload.get("validation_rules", []),
-                "agent_playbook": payload.get("agent_playbook", []),
-                "agent_signals": payload.get(
-                    "agent_signals", {"importance": "medium", "enforcement": "should"}
-                ),
-                "index_terms": payload.get("index_terms", []),
-            }
+                markup = {
+                    "id": adr_id,
+                    "title": payload.get("title", adr_id),
+                    "scope": normalize_adr_scope(payload.get("scope", scope_hint)),
+                    "created_at": now_iso(),
+                    "updated_at": now_iso(),
+                    "decision": payload.get("decision", "").strip(),
+                    "related": related_ids,
+                    "validation_rules": payload.get("validation_rules", []),
+                    "agent_playbook": payload.get("agent_playbook", []),
+                    "agent_signals": payload.get(
+                        "agent_signals", {"importance": "medium", "enforcement": "should"}
+                    ),
+                    "index_terms": payload.get("index_terms", []),
+                }
 
-            content = render_adr(markup, payload)
-            write_file(adr_path, content)
+                content = render_adr(markup, payload)
+                write_file(adr_path, content)
 
-            catalog_entry = {
-                "id": adr_id,
-                "title": markup["title"],
-                "scope": markup["scope"],
-                "related": related_ids,
-                "validation_rules": markup["validation_rules"],
-                "path": display_path(adr_path),
-                "decision": markup["decision"],
-                "agent_playbook": markup["agent_playbook"],
-                "agent_signals": markup["agent_signals"],
-                "index_terms": markup["index_terms"],
-                "updated_at": markup["updated_at"],
-            }
-            new_catalog_entries.append(catalog_entry)
-            log(f"Generated ADR {adr_id} -> {adr_path}")
-            candidate_deletions.add(path)
+                catalog_entry = {
+                    "id": adr_id,
+                    "title": markup["title"],
+                    "scope": markup["scope"],
+                    "related": related_ids,
+                    "validation_rules": markup["validation_rules"],
+                    "path": display_path(adr_path),
+                    "decision": markup["decision"],
+                    "agent_playbook": markup["agent_playbook"],
+                    "agent_signals": markup["agent_signals"],
+                    "index_terms": markup["index_terms"],
+                    "updated_at": markup["updated_at"],
+                }
+                new_catalog_entries.append(catalog_entry)
+                log(f"Generated ADR {adr_id} -> {adr_path}")
+                candidate_deletions.add(path)
 
-        # delete non-candidates and processed candidates
-        to_delete = set(non_candidates) | non_candidate_deletions | candidate_deletions
-        for path in to_delete:
-            try:
-                path.unlink()
-                log(f"Deleted AAR: {path}")
-            except Exception as exc:  # pragma: no cover - filesystem issue
-                log(f"Failed to delete AAR {path}: {exc}")
+            # delete non-candidates and processed candidates
+            to_delete = set(non_candidates) | non_candidate_deletions | candidate_deletions
+            for path in to_delete:
+                try:
+                    path.unlink()
+                    log(f"Deleted AAR: {path}")
+                except Exception as exc:  # pragma: no cover - filesystem issue
+                    log(f"Failed to delete AAR {path}: {exc}")
 
+        # Always regenerate the index from what is on disk, even when there are
+        # no AAR promotion candidates this run. Otherwise manual edits to
+        # existing ADR files (or their removal) never get absorbed until the
+        # next promotion happens to fire, which can be an arbitrarily long time.
         full_catalog = catalog + new_catalog_entries
         write_index(full_catalog, context)
         log(f"Index updated with {len(full_catalog)} entries at {context.index_path}")
 
     if not processed_any:
         log("No ADR candidates found in any configured docs dir.")
+
+    if PARSE_FAILURES:
+        log(f"ERROR: {len(PARSE_FAILURES)} ADR file(s) failed front matter parsing:")
+        for path, reason in PARSE_FAILURES:
+            log(f"  - {display_path(path)}: {reason}")
+        raise RuntimeError(
+            f"{len(PARSE_FAILURES)} ADR file(s) failed front matter parsing; "
+            "fix front matter before the index can be trusted (see log above)."
+        )
 
 
 if __name__ == "__main__":

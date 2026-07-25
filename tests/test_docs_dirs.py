@@ -1,7 +1,10 @@
 import importlib.util
+import json
 import sys
 import types
 from pathlib import Path
+
+import pytest
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "adr2_agent_action.py"
@@ -107,3 +110,96 @@ def test_candidate_decision_accepts_valid_candidate(monkeypatch, tmp_path):
 
     assert is_candidate is True
     assert scope == "api-contract"
+
+
+def _write_adr(path, *, front_matter_yaml, body=""):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"---\n{front_matter_yaml}\n---\n\n{body}", encoding="utf-8")
+
+
+def test_parse_front_matter_records_failure_without_raising(monkeypatch, tmp_path):
+    module = load_module(monkeypatch, tmp_path)
+
+    bad_adr = tmp_path / "docs" / "adr" / "ADR-0001-broken.md"
+    _write_adr(
+        bad_adr,
+        front_matter_yaml="id: ADR-0001\nvalidation_rules:\n- `unterminated backtick scalar",
+    )
+
+    module.PARSE_FAILURES.clear()
+    meta, _ = module.parse_front_matter(bad_adr)
+
+    assert meta == {}
+    assert len(module.PARSE_FAILURES) == 1
+    assert module.PARSE_FAILURES[0][0] == bad_adr
+
+
+def test_catalog_existing_adrs_drops_unparseable_but_records_failure(monkeypatch, tmp_path):
+    module = load_module(monkeypatch, tmp_path)
+    contexts = module.resolve_docs_contexts()
+    context = contexts[0]
+
+    good_adr = context.adr_dir / "ADR-0002-ok.md"
+    _write_adr(good_adr, front_matter_yaml="id: ADR-0002\ntitle: Ok")
+    bad_adr = context.adr_dir / "ADR-0001-broken.md"
+    _write_adr(
+        bad_adr,
+        front_matter_yaml="id: ADR-0001\nvalidation_rules:\n- `unterminated backtick scalar",
+    )
+
+    module.PARSE_FAILURES.clear()
+    catalog = module.catalog_existing_adrs(context)
+
+    assert [item["id"] for item in catalog] == ["ADR-0002"]
+    assert len(module.PARSE_FAILURES) == 1
+
+
+def test_main_regenerates_index_with_no_aar_candidates(monkeypatch, tmp_path):
+    module = load_module(monkeypatch, tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key-not-used")
+    contexts = module.resolve_docs_contexts()
+    context = contexts[0]
+
+    adr_path = context.adr_dir / "ADR-0001-existing.md"
+    _write_adr(adr_path, front_matter_yaml="id: ADR-0001\ntitle: Existing ADR")
+
+    (tmp_path / "README.md").write_text("ADR2 instructions", encoding="utf-8")
+
+    module.main()
+
+    assert context.index_path.exists()
+    written = json.loads(context.index_path.read_text(encoding="utf-8"))
+    assert written["count"] == 1
+    assert written["items"][0]["id"] == "ADR-0001"
+
+
+def test_main_raises_when_a_front_matter_parse_failure_exists(monkeypatch, tmp_path):
+    module = load_module(monkeypatch, tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key-not-used")
+    contexts = module.resolve_docs_contexts()
+    context = contexts[0]
+
+    bad_adr = context.adr_dir / "ADR-0001-broken.md"
+    _write_adr(
+        bad_adr,
+        front_matter_yaml="id: ADR-0001\nvalidation_rules:\n- `unterminated backtick scalar",
+    )
+    (tmp_path / "README.md").write_text("ADR2 instructions", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="front matter parsing"):
+        module.main()
+
+
+def test_already_promoted_removed(monkeypatch, tmp_path):
+    module = load_module(monkeypatch, tmp_path)
+
+    assert not hasattr(module, "already_promoted")
+
+
+def test_normalize_adr_scope_coerces_invalid_values(monkeypatch, tmp_path):
+    module = load_module(monkeypatch, tmp_path)
+
+    assert module.normalize_adr_scope("api") == "api"
+    assert module.normalize_adr_scope("frontend/ui") == module.DEFAULT_ADR_SCOPE
+    assert module.normalize_adr_scope("") == module.DEFAULT_ADR_SCOPE
+    assert module.normalize_adr_scope(None) == module.DEFAULT_ADR_SCOPE
