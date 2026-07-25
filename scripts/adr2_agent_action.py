@@ -823,6 +823,62 @@ def normalize_string_list(value: Any) -> List[str]:
     return [str(value).strip()]
 
 
+# index_terms drift: 92%+ of index_terms across the corpus are hapax (used by
+# a single ADR), and existing ones frequently disagree on casing/separators
+# for the same concept (e.g. "measurement-v2" vs "Measurement V2", "settopbox"
+# vs "set-top-box"). Rather than impose one universal casing rule on every new
+# term (which would fight established acronym conventions like MDM/WiFi/RBAC),
+# new terms are aliased against whatever canonical form the existing catalog
+# already established for the same underlying concept.
+_INDEX_TERM_SEPARATORS_RE = re.compile(r"[\s_/-]+")
+
+
+def index_term_key(term: str) -> str:
+    """Normalize a term to a separator/case-insensitive identity key."""
+    return _INDEX_TERM_SEPARATORS_RE.sub("", term.strip().lower())
+
+
+def build_index_term_canonical_map(catalog: Iterable[Dict[str, Any]]) -> Dict[str, str]:
+    """Pick one canonical surface form per index-term identity key.
+
+    Ties (including single-occurrence terms) resolve alphabetically so the
+    map is deterministic across runs.
+    """
+    forms_by_key: Dict[str, Dict[str, int]] = {}
+    for entry in catalog:
+        for term in normalize_string_list(entry.get("index_terms")):
+            key = index_term_key(term)
+            if not key:
+                continue
+            counts = forms_by_key.setdefault(key, {})
+            counts[term] = counts.get(term, 0) + 1
+
+    canonical: Dict[str, str] = {}
+    for key, counts in forms_by_key.items():
+        ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        canonical[key] = ranked[0][0]
+    return canonical
+
+
+def canonicalize_index_terms(
+    terms: Iterable[str], canonical_map: Dict[str, str]
+) -> List[str]:
+    """Alias each term to its established canonical spelling when known.
+
+    Terms whose identity key is not yet in the map (genuinely new concepts)
+    pass through unchanged aside from whitespace trimming.
+    """
+    resolved: List[str] = []
+    seen: set[str] = set()
+    for term in normalize_string_list(terms):
+        key = index_term_key(term)
+        canonical_term = canonical_map.get(key, term) if key else term
+        if canonical_term not in seen:
+            seen.add(canonical_term)
+            resolved.append(canonical_term)
+    return resolved
+
+
 def maybe_enrich_validation_rules(prompts: Dict[str, str], payload: Dict[str, Any]) -> None:
     """
     - 생성된 ADR의 핵심 텍스트로부터 추가 validation_rules를 추출해 병합.
@@ -1047,6 +1103,7 @@ def main() -> None:
         log(f"Docs dir: {display_path(context.docs_dir)}")
         catalog = catalog_existing_adrs(context)
         log(f"Loaded catalog with {len(catalog)} existing ADR(s).")
+        index_term_canonical_map = build_index_term_canonical_map(catalog)
 
         detections, non_candidates = detect_candidates(prompts, context)
         non_candidate_deletions: set[Path] = set()
@@ -1066,7 +1123,9 @@ def main() -> None:
                 payload["consequences"] = normalize_string_list(payload.get("consequences"))
                 payload["validation_rules"] = normalize_string_list(payload.get("validation_rules"))
                 payload["agent_playbook"] = normalize_string_list(payload.get("agent_playbook"))
-                payload["index_terms"] = normalize_string_list(payload.get("index_terms"))
+                payload["index_terms"] = canonicalize_index_terms(
+                    payload.get("index_terms"), index_term_canonical_map
+                )
                 if not isinstance(payload.get("agent_signals"), dict):
                     payload["agent_signals"] = {"importance": "medium", "enforcement": "should"}
 

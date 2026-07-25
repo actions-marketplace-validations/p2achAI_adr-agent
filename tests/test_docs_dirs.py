@@ -203,3 +203,44 @@ def test_normalize_adr_scope_coerces_invalid_values(monkeypatch, tmp_path):
     assert module.normalize_adr_scope("frontend/ui") == module.DEFAULT_ADR_SCOPE
     assert module.normalize_adr_scope("") == module.DEFAULT_ADR_SCOPE
     assert module.normalize_adr_scope(None) == module.DEFAULT_ADR_SCOPE
+
+
+def test_index_term_key_folds_case_and_separators(monkeypatch, tmp_path):
+    module = load_module(monkeypatch, tmp_path)
+
+    assert module.index_term_key("measurement-v2") == module.index_term_key("Measurement V2")
+    assert module.index_term_key("settopbox") == module.index_term_key("set-top-box")
+    assert module.index_term_key("settopbox") == module.index_term_key("SettopBox")
+
+
+def test_build_index_term_canonical_map_picks_majority_form(monkeypatch, tmp_path):
+    module = load_module(monkeypatch, tmp_path)
+
+    catalog = [
+        {"index_terms": ["wifi", "WiFi"]},
+        {"index_terms": ["wifi"]},
+        {"index_terms": ["wifi", "measurement-v2"]},
+        {"index_terms": ["Measurement V2"]},
+    ]
+    canonical_map = module.build_index_term_canonical_map(catalog)
+
+    assert canonical_map[module.index_term_key("wifi")] == "wifi"
+    assert canonical_map[module.index_term_key("measurement-v2")] == "Measurement V2"
+
+
+def test_canonicalize_index_terms_aliases_known_and_passes_through_new(monkeypatch, tmp_path):
+    module = load_module(monkeypatch, tmp_path)
+
+    canonical_map = {module.index_term_key("wifi"): "wifi"}
+    result = module.canonicalize_index_terms(["WiFi", "brand-new-term"], canonical_map)
+
+    assert result == ["wifi", "brand-new-term"]
+
+
+def test_canonicalize_index_terms_dedupes_after_aliasing(monkeypatch, tmp_path):
+    module = load_module(monkeypatch, tmp_path)
+
+    canonical_map = {module.index_term_key("wifi"): "wifi"}
+    result = module.canonicalize_index_terms(["WiFi", "wifi", "WIFI"], canonical_map)
+
+    assert result == ["wifi"]
