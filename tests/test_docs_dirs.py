@@ -244,3 +244,108 @@ def test_canonicalize_index_terms_dedupes_after_aliasing(monkeypatch, tmp_path):
     result = module.canonicalize_index_terms(["WiFi", "wifi", "WIFI"], canonical_map)
 
     assert result == ["wifi"]
+
+
+def _write_domains_yml(context, entries):
+    lines = ["domains:"]
+    for entry in entries:
+        lines.append(f"  - key: {entry['key']}")
+        lines.append(f"    label: \"{entry.get('label', entry['key'])}\"")
+        terms = entry.get("match_terms", [])
+        if terms:
+            lines.append("    match_terms:")
+            for term in terms:
+                lines.append(f"      - {term}")
+    context.domains_path.parent.mkdir(parents=True, exist_ok=True)
+    context.domains_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_load_domains_returns_empty_without_domains_yml(monkeypatch, tmp_path):
+    module = load_module(monkeypatch, tmp_path)
+    context = module.resolve_docs_contexts()[0]
+
+    assert module.load_domains(context) == []
+
+
+def test_load_domains_parses_curated_taxonomy(monkeypatch, tmp_path):
+    module = load_module(monkeypatch, tmp_path)
+    context = module.resolve_docs_contexts()[0]
+    _write_domains_yml(
+        context,
+        [
+            {"key": "wifi-analytics", "label": "WiFi 분석", "match_terms": ["wifi", "유동인구"]},
+            {"key": "mdm-io", "label": "MDM/IO", "match_terms": ["mdm", "settopbox"]},
+        ],
+    )
+
+    domains = module.load_domains(context)
+
+    assert [d.key for d in domains] == ["wifi-analytics", "mdm-io"]
+    assert domains[0].match_terms == ("wifi", "유동인구")
+
+
+def test_resolve_domain_prefers_validated_proposal(monkeypatch, tmp_path):
+    module = load_module(monkeypatch, tmp_path)
+    context = module.resolve_docs_contexts()[0]
+    _write_domains_yml(
+        context, [{"key": "wifi-analytics", "match_terms": ["wifi"]}, {"key": "mdm-io", "match_terms": ["mdm"]}]
+    )
+    domains = module.load_domains(context)
+
+    domain = module.resolve_domain({"title": "mdm thing"}, domains, proposed="wifi-analytics")
+
+    assert domain == "wifi-analytics"
+
+
+def test_resolve_domain_falls_back_to_match_terms_then_unclassified(monkeypatch, tmp_path):
+    module = load_module(monkeypatch, tmp_path)
+    context = module.resolve_docs_contexts()[0]
+    _write_domains_yml(
+        context, [{"key": "wifi-analytics", "match_terms": ["wifi"]}]
+    )
+    domains = module.load_domains(context)
+
+    fallback = module.resolve_domain(
+        {"title": "WiFi 대시보드 집계", "index_terms": []}, domains, proposed="not-a-real-domain"
+    )
+    unclassified = module.resolve_domain({"title": "unrelated topic"}, domains, proposed=None)
+
+    assert fallback == "wifi-analytics"
+    assert unclassified == module.UNCLASSIFIED_DOMAIN
+
+
+def test_main_assigns_domain_to_generated_adr_and_index(monkeypatch, tmp_path):
+    module = load_module(monkeypatch, tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key-not-used")
+    context = module.resolve_docs_contexts()[0]
+    _write_domains_yml(
+        context, [{"key": "wifi-analytics", "match_terms": ["wifi"]}, {"key": "mdm-io", "match_terms": ["mdm"]}]
+    )
+    (tmp_path / "README.md").write_text("ADR2 instructions", encoding="utf-8")
+
+    aar_path = context.aar_dir / "wifi-note.md"
+    aar_path.parent.mkdir(parents=True, exist_ok=True)
+    aar_path.write_text("WiFi dashboard aggregation decision", encoding="utf-8")
+
+    def fake_call_openai_json_object(system_prompt, user_content, model=None, *, instructions=None):
+        if "isCandidate" in system_prompt or "candidate" in system_prompt.lower():
+            return {"isCandidate": True, "decisionScope": "architecture-boundary"}
+        return {
+            "title": "WiFi 집계 규칙",
+            "scope": "architecture",
+            "decision": "WiFi 집계는 새 규칙을 따른다.",
+            "domain": "wifi-analytics",
+            "index_terms": ["wifi"],
+        }
+
+    monkeypatch.setattr(module, "call_openai_json_object", fake_call_openai_json_object)
+
+    module.main()
+
+    written = json.loads(context.index_path.read_text(encoding="utf-8"))
+    assert written["items"][0]["domain"] == "wifi-analytics"
+
+    adr_files = list(context.adr_dir.glob("ADR-*.md"))
+    assert len(adr_files) == 1
+    meta, _ = module.parse_front_matter(adr_files[0])
+    assert meta["domain"] == "wifi-analytics"

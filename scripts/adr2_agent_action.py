@@ -373,6 +373,21 @@ def normalize_domain(value: Any, domains: Iterable[Domain]) -> str | None:
     return None
 
 
+def stringify(value: Any) -> str:
+    """Flatten an arbitrary JSON-ish value into a plain string for matching."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if isinstance(value, list):
+        return " ".join(stringify(item) for item in value)
+    if isinstance(value, dict):
+        return " ".join(f"{key} {stringify(item)}" for key, item in value.items())
+    return str(value)
+
+
 def _domain_haystack(record: Dict[str, Any]) -> str:
     parts = [
         stringify(record.get("title")),
@@ -766,16 +781,19 @@ def detect_candidates(
     return candidates, non_candidates
 
 
-def build_generator_prompt(prompts: Dict[str, str]) -> str:
+def build_generator_prompt(
+    prompts: Dict[str, str], domains: List[Domain] | None = None
+) -> str:
     language_hint = f"Write the ADR in {DEFAULT_LANGUAGE}."
     base = (
         f"{language_hint}\n\n{prompts.get('generate', '')}".strip()
     )
+    domain_key = '"domain",' if domains else ""
     schema_hint = (
         "Return ONLY a JSON object with keys:"
         ' {"title","scope","decision","context","rationale",'
         '"alternatives","consequences","validation_rules","agent_playbook",'
-        '"agent_signals","related_suggestions","index_terms"}. '
+        f'"agent_signals","related_suggestions","index_terms",{domain_key}}}. '
         "Use short, declarative language for agents. "
         'Scope must be one of ["architecture","infrastructure","data-model","api","component"]. '
         "Alternatives and consequences must be arrays. "
@@ -786,13 +804,23 @@ def build_generator_prompt(prompts: Dict[str, str]) -> str:
         "index_terms is an array of 3-7 short keywords for retrieval. "
         "Do not include markdown or prose outside of the JSON object."
     )
+    if domains:
+        domain_list = ", ".join(f'"{d.key}"' for d in domains)
+        schema_hint += (
+            f" domain must be exactly one key from this taxonomy based on the"
+            f" ADR's primary authoritative boundary: [{domain_list}]. If none"
+            " fit well, omit the domain field rather than guessing."
+        )
     return f"{base}\n\n{schema_hint}".strip()
 
 
 def generate_adr_payload(
-    prompts: Dict[str, str], aar_text: str, scope_hint: str
+    prompts: Dict[str, str],
+    aar_text: str,
+    scope_hint: str,
+    domains: List[Domain] | None = None,
 ) -> Dict:
-    system_prompt = build_generator_prompt(prompts)
+    system_prompt = build_generator_prompt(prompts, domains)
     instructions = prompts.get("adr2", "")
     payload = call_openai_json_object(
         system_prompt,
@@ -809,6 +837,7 @@ def generate_adr_payload(
     )
     payload.setdefault("related_suggestions", [])
     payload.setdefault("index_terms", [])
+    payload.setdefault("domain", "")
     return payload
 
 
@@ -980,19 +1009,27 @@ def render_adr(markup: Dict, body: Dict) -> str:
         "id": markup["id"],
         "title": markup["title"],
         "scope": markup["scope"],
-        "created_at": markup["created_at"],
-        "updated_at": markup["updated_at"],
-        "decision": markup["decision"],
-        "related": markup.get("related", []),
-        "validation_rules": validation_rules,
-        "agent_playbook": agent_playbook,
-        "agent_signals": agent_signals,
-        "index_terms": index_terms,
-        "context": body.get("context", "").strip(),
-        "rationale": body.get("rationale", "").strip(),
-        "alternatives": alternatives,
-        "consequences": consequences,
     }
+    # domain is only emitted when a docs dir has opted in via domains.yml, so
+    # ADRs in repos/apps without a taxonomy stay byte-for-byte unaffected.
+    if markup.get("domain"):
+        front_matter["domain"] = markup["domain"]
+    front_matter.update(
+        {
+            "created_at": markup["created_at"],
+            "updated_at": markup["updated_at"],
+            "decision": markup["decision"],
+            "related": markup.get("related", []),
+            "validation_rules": validation_rules,
+            "agent_playbook": agent_playbook,
+            "agent_signals": agent_signals,
+            "index_terms": index_terms,
+            "context": body.get("context", "").strip(),
+            "rationale": body.get("rationale", "").strip(),
+            "alternatives": alternatives,
+            "consequences": consequences,
+        }
+    )
 
     # Hybrid format: structured front matter + minimal human-readable context body.
     yaml_output = yaml.dump(
@@ -1035,6 +1072,7 @@ def catalog_existing_adrs(context: DocsContext) -> List[Dict]:
                 "id": meta.get("id"),
                 "title": meta.get("title"),
                 "scope": meta.get("scope"),
+                "domain": meta.get("domain"),
                 "related": meta.get("related", []),
                 "validation_rules": meta.get("validation_rules", []),
                 "agent_playbook": meta.get("agent_playbook", []),
@@ -1057,11 +1095,15 @@ def write_index(catalog: List[Dict], context: DocsContext) -> None:
 
     thin_items = []
     for item in catalog:
-        thin_items.append(
+        thin_item = {
+            "id": item.get("id"),
+            "title": item.get("title"),
+            "scope": item.get("scope"),
+        }
+        if item.get("domain"):
+            thin_item["domain"] = item.get("domain")
+        thin_item.update(
             {
-                "id": item.get("id"),
-                "title": item.get("title"),
-                "scope": item.get("scope"),
                 "path": item.get("path"),
                 "related": item.get("related", []),
                 "index_terms": item.get("index_terms", []),
@@ -1070,6 +1112,7 @@ def write_index(catalog: List[Dict], context: DocsContext) -> None:
                 "updated_at": item.get("updated_at"),
             }
         )
+        thin_items.append(thin_item)
 
     payload = {
         "generated_at": now_iso(),
@@ -1104,6 +1147,9 @@ def main() -> None:
         catalog = catalog_existing_adrs(context)
         log(f"Loaded catalog with {len(catalog)} existing ADR(s).")
         index_term_canonical_map = build_index_term_canonical_map(catalog)
+        domains = load_domains(context)
+        if domains:
+            log(f"Loaded {len(domains)} domain(s) from {display_path(context.domains_path)}.")
 
         detections, non_candidates = detect_candidates(prompts, context)
         non_candidate_deletions: set[Path] = set()
@@ -1117,7 +1163,7 @@ def main() -> None:
             for path, detection in detections:
                 scope_hint = detection.get("decisionScope", "architecture")
                 aar_text = read_file(path)
-                payload = generate_adr_payload(prompts, aar_text, scope_hint)
+                payload = generate_adr_payload(prompts, aar_text, scope_hint, domains)
                 maybe_enrich_validation_rules(prompts, payload)
                 payload["alternatives"] = normalize_string_list(payload.get("alternatives"))
                 payload["consequences"] = normalize_string_list(payload.get("consequences"))
@@ -1137,11 +1183,15 @@ def main() -> None:
                 related_ids = resolve_related(
                     payload.get("related_suggestions", []), catalog + new_catalog_entries
                 )
+                domain = resolve_domain(payload, domains, proposed=payload.get("domain"))
+                if domain == UNCLASSIFIED_DOMAIN:
+                    log(f"WARNING: domain unclassified for {adr_id} ({payload.get('title', '')!r}).")
 
                 markup = {
                     "id": adr_id,
                     "title": payload.get("title", adr_id),
                     "scope": normalize_adr_scope(payload.get("scope", scope_hint)),
+                    "domain": domain,
                     "created_at": now_iso(),
                     "updated_at": now_iso(),
                     "decision": payload.get("decision", "").strip(),
@@ -1161,6 +1211,7 @@ def main() -> None:
                     "id": adr_id,
                     "title": markup["title"],
                     "scope": markup["scope"],
+                    "domain": markup["domain"],
                     "related": related_ids,
                     "validation_rules": markup["validation_rules"],
                     "path": display_path(adr_path),
