@@ -94,6 +94,26 @@ runs:
           test -f "${index_path}" && cat "${index_path}" || echo "index.json not created"
         done
 
+    - name: Stage changed docs paths
+      shell: bash
+      env:
+        ADR2_ADD_PATHS: ${{ inputs.add_paths }}
+      run: |
+        set -euo pipefail
+
+        # peter-evans/create-pull-request's add-paths passes every pattern to
+        # a single `git add -- <pattern1> <pattern2> ...` call, and git aborts
+        # that entire call the moment ANY one pattern matches zero paths (e.g.
+        # an app's docs/aar/ is empty because every AAR was just consumed).
+        # That would throw away staging for patterns that DID match too.
+        # Stage each pattern independently here, tolerating zero-match
+        # patterns individually, then omit add-paths below so the PR step
+        # just picks up whatever is already staged.
+        while IFS= read -r pattern; do
+          [ -z "$pattern" ] && continue
+          git add -A -- "$pattern" 2>/dev/null || true
+        done <<< "$ADR2_ADD_PATHS"
+
     - name: Create PR if changes
       uses: peter-evans/create-pull-request@v6
       with:
@@ -105,4 +125,3 @@ runs:
         base: ${{ inputs.pr_base }}
         delete-branch: true
         reviewers: ${{ inputs.reviewers }}
-        add-paths: ${{ inputs.add_paths }}

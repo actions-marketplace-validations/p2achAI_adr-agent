@@ -1114,12 +1114,29 @@ def write_index(catalog: List[Dict], context: DocsContext) -> None:
         )
         thin_items.append(thin_item)
 
+    items = sorted(thin_items, key=lambda c: c.get("id", ""))
+
+    # Regenerating unconditionally (see main()) means most runs find zero
+    # drift. Rewriting the file anyway would still bump generated_at every
+    # single time, turning every run into a spurious diff/commit even when
+    # nothing about the ADR corpus actually changed. Only write when the
+    # actual entries differ from what's already on disk.
+    if context.index_path.exists():
+        try:
+            existing = json.loads(read_file(context.index_path))
+        except (json.JSONDecodeError, OSError):
+            existing = None
+        if isinstance(existing, dict) and existing.get("items") == items:
+            log(f"Index unchanged at {context.index_path}; skipping rewrite.")
+            return
+
     payload = {
         "generated_at": now_iso(),
-        "count": len(thin_items),
-        "items": sorted(thin_items, key=lambda c: c.get("id", "")),
+        "count": len(items),
+        "items": items,
     }
     write_file(context.index_path, json.dumps(payload, indent=2, ensure_ascii=False))
+    log(f"Index updated with {len(items)} entries at {context.index_path}")
 
 
 def main() -> None:
@@ -1240,7 +1257,6 @@ def main() -> None:
         # next promotion happens to fire, which can be an arbitrarily long time.
         full_catalog = catalog + new_catalog_entries
         write_index(full_catalog, context)
-        log(f"Index updated with {len(full_catalog)} entries at {context.index_path}")
 
     if not processed_any:
         log("No ADR candidates found in any configured docs dir.")
