@@ -173,6 +173,72 @@ def test_main_regenerates_index_with_no_aar_candidates(monkeypatch, tmp_path):
     assert written["items"][0]["id"] == "ADR-0001"
 
 
+def test_main_rerun_with_no_changes_does_not_touch_index_file(monkeypatch, tmp_path):
+    module = load_module(monkeypatch, tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key-not-used")
+    context = module.resolve_docs_contexts()[0]
+
+    adr_path = context.adr_dir / "ADR-0001-existing.md"
+    _write_adr(adr_path, front_matter_yaml="id: ADR-0001\ntitle: Existing ADR")
+    (tmp_path / "README.md").write_text("ADR2 instructions", encoding="utf-8")
+
+    module.main()
+    first_mtime = context.index_path.stat().st_mtime_ns
+    first_content = context.index_path.read_bytes()
+
+    # A second run against an unchanged corpus (the common steady state once
+    # every run regenerates the index) must not rewrite the file at all --
+    # otherwise every no-op CI run would still produce a spurious diff.
+    module.main()
+
+    assert context.index_path.stat().st_mtime_ns == first_mtime
+    assert context.index_path.read_bytes() == first_content
+
+
+def test_write_index_is_a_noop_when_items_unchanged(monkeypatch, tmp_path):
+    module = load_module(monkeypatch, tmp_path)
+    context = module.resolve_docs_contexts()[0]
+
+    good_adr = context.adr_dir / "ADR-0001-existing.md"
+    _write_adr(good_adr, front_matter_yaml="id: ADR-0001\ntitle: Existing ADR")
+    catalog = module.catalog_existing_adrs(context)
+
+    module.write_index(catalog, context)
+    first_write = context.index_path.read_text(encoding="utf-8")
+    first_generated_at = json.loads(first_write)["generated_at"]
+
+    # Re-running with an identical catalog must not touch generated_at (or
+    # the file at all) -- otherwise every no-op run would still churn a
+    # timestamp-only diff.
+    module.write_index(catalog, context)
+    second_write = context.index_path.read_text(encoding="utf-8")
+
+    assert second_write == first_write
+    assert json.loads(second_write)["generated_at"] == first_generated_at
+
+
+def test_write_index_rewrites_when_items_actually_change(monkeypatch, tmp_path):
+    module = load_module(monkeypatch, tmp_path)
+    context = module.resolve_docs_contexts()[0]
+
+    good_adr = context.adr_dir / "ADR-0001-existing.md"
+    _write_adr(good_adr, front_matter_yaml="id: ADR-0001\ntitle: Existing ADR")
+    catalog = module.catalog_existing_adrs(context)
+    module.write_index(catalog, context)
+    first_generated_at = json.loads(context.index_path.read_text(encoding="utf-8"))["generated_at"]
+
+    _write_adr(good_adr, front_matter_yaml="id: ADR-0001\ntitle: Renamed ADR")
+    changed_catalog = module.catalog_existing_adrs(context)
+    module.write_index(changed_catalog, context)
+    written = json.loads(context.index_path.read_text(encoding="utf-8"))
+
+    assert written["items"][0]["title"] == "Renamed ADR"
+    # generated_at may or may not differ depending on clock resolution, but
+    # the important behavior (rewrite happened) is covered by the title
+    # assertion above; this just documents intent.
+    assert isinstance(first_generated_at, str)
+
+
 def test_main_raises_when_a_front_matter_parse_failure_exists(monkeypatch, tmp_path):
     module = load_module(monkeypatch, tmp_path)
     monkeypatch.setenv("OPENAI_API_KEY", "test-key-not-used")
