@@ -348,6 +348,30 @@ def test_consolidate_reclassifies_ownership_when_independent_documents_collide(m
     assert module.validate_catalog(module.catalog_existing_adrs(context), require_ownership=True) == []
 
 
+def test_backfill_uses_valid_proposed_domain_when_terms_do_not_match(monkeypatch, tmp_path):
+    module = load_module(monkeypatch, tmp_path)
+    context = module.resolve_docs_contexts()[0]
+    path = context.adr_dir / "ADR-0001-existing.md"
+    write_adr(path, domain="unclassified", owns=[])
+    catalog = module.catalog_existing_adrs(context)
+    domains = [module.Domain("forms-ux", "Forms", ("form",), None)]
+    monkeypatch.setattr(
+        module,
+        "call_openai_json_object",
+        lambda *args, **kwargs: {
+            "domain": "forms-ux",
+            "owns": [{"type": "runtime", "key": "image.compression"}],
+            "contracts": [],
+            "applies_to": {"paths": [], "symbols": []},
+        },
+    )
+
+    module.backfill_ownership({"ownership": "prompt"}, catalog, domains)
+
+    meta, _ = module.parse_front_matter(path)
+    assert meta["domain"] == "forms-ux"
+
+
 def test_catalog_validation_rejects_missing_and_duplicate_ownership(monkeypatch, tmp_path):
     module = load_module(monkeypatch, tmp_path)
     catalog = [

@@ -1415,12 +1415,16 @@ def backfill_ownership(prompts: Dict[str, str], catalog: List[Dict], domains: Li
             continue
         path = resolve_repo_path(str(item["path"]))
         meta, body = parse_front_matter(path)
+        proposed = call_openai_json_object(
+            prompts["ownership"],
+            json.dumps(
+                {"adr": meta, "allowed_domains": [domain.key for domain in domains]},
+                ensure_ascii=False,
+                indent=2,
+            ),
+            instructions=prompts.get("adr2", ""),
+        )
         if needs_ownership:
-            proposed = call_openai_json_object(
-                prompts["ownership"],
-                json.dumps(meta, ensure_ascii=False, indent=2),
-                instructions=prompts.get("adr2", ""),
-            )
             owns = [entry for entry in proposed.get("owns") or [] if isinstance(entry, dict)]
             if not owns:
                 log(f"Ownership backfill deferred: {item.get('id')}")
@@ -1433,7 +1437,7 @@ def backfill_ownership(prompts: Dict[str, str], catalog: List[Dict], domains: Li
                 "symbols": normalize_string_list(applies.get("symbols")),
             }
         if domains:
-            meta["domain"] = resolve_domain(meta, domains, meta.get("domain"))
+            meta["domain"] = resolve_domain(meta, domains, proposed.get("domain") or meta.get("domain"))
         current_relations = meta.get("relations") if isinstance(meta.get("relations"), dict) else {}
         meta["relations"] = {
             "related": merge_unique(current_relations.get("related") or [], meta.get("related") or []),
