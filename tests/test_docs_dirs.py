@@ -70,48 +70,6 @@ def test_docs_dirs_contexts_accept_absolute_paths(monkeypatch, tmp_path):
     assert module.display_path(external_docs.resolve()) == str(external_docs.resolve())
 
 
-def test_candidate_decision_requires_boolean_true(monkeypatch, tmp_path):
-    module = load_module(monkeypatch, tmp_path)
-
-    is_candidate, scope = module.normalize_candidate_decision(
-        {"isCandidate": "false", "decisionScope": "api-contract"}
-    )
-
-    assert is_candidate is False
-    assert scope == "api-contract"
-
-
-def test_candidate_decision_rejects_missing_scope(monkeypatch, tmp_path):
-    module = load_module(monkeypatch, tmp_path)
-
-    is_candidate, scope = module.normalize_candidate_decision({"isCandidate": True})
-
-    assert is_candidate is False
-    assert scope == ""
-
-
-def test_candidate_decision_rejects_minor_change(monkeypatch, tmp_path):
-    module = load_module(monkeypatch, tmp_path)
-
-    is_candidate, scope = module.normalize_candidate_decision(
-        {"isCandidate": True, "decisionScope": "minor-change"}
-    )
-
-    assert is_candidate is False
-    assert scope == "minor-change"
-
-
-def test_candidate_decision_accepts_valid_candidate(monkeypatch, tmp_path):
-    module = load_module(monkeypatch, tmp_path)
-
-    is_candidate, scope = module.normalize_candidate_decision(
-        {"isCandidate": True, "decisionScope": "api-contract"}
-    )
-
-    assert is_candidate is True
-    assert scope == "api-contract"
-
-
 def _write_adr(path, *, front_matter_yaml, body=""):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f"---\n{front_matter_yaml}\n---\n\n{body}", encoding="utf-8")
@@ -156,7 +114,7 @@ def test_catalog_existing_adrs_drops_unparseable_but_records_failure(monkeypatch
 
 def test_main_regenerates_index_with_no_aar_candidates(monkeypatch, tmp_path):
     module = load_module(monkeypatch, tmp_path)
-    monkeypatch.setenv("OPENAI_API_KEY", "test-key-not-used")
+    monkeypatch.setenv("ADR2_OPERATION", "index")
     contexts = module.resolve_docs_contexts()
     context = contexts[0]
 
@@ -175,7 +133,7 @@ def test_main_regenerates_index_with_no_aar_candidates(monkeypatch, tmp_path):
 
 def test_main_rerun_with_no_changes_does_not_touch_index_file(monkeypatch, tmp_path):
     module = load_module(monkeypatch, tmp_path)
-    monkeypatch.setenv("OPENAI_API_KEY", "test-key-not-used")
+    monkeypatch.setenv("ADR2_OPERATION", "index")
     context = module.resolve_docs_contexts()[0]
 
     adr_path = context.adr_dir / "ADR-0001-existing.md"
@@ -394,18 +352,22 @@ def test_main_assigns_domain_to_generated_adr_and_index(monkeypatch, tmp_path):
     aar_path.write_text("WiFi dashboard aggregation decision", encoding="utf-8")
 
     def fake_call_openai_json_object(system_prompt, user_content, model=None, *, instructions=None):
-        if "isCandidate" in system_prompt or "candidate" in system_prompt.lower():
-            return {"isCandidate": True, "decisionScope": "architecture-boundary"}
+        if "RECONCILIATION_ACTION" in system_prompt:
+            return {"action": "create", "decision_scope": "architecture"}
         return {
             "title": "WiFi 집계 규칙",
             "scope": "architecture",
             "decision": "WiFi 집계는 새 규칙을 따른다.",
             "domain": "wifi-analytics",
             "index_terms": ["wifi"],
+            "owns": [{"type": "contract", "key": "wifi.aggregation"}],
         }
 
     monkeypatch.setattr(module, "call_openai_json_object", fake_call_openai_json_object)
 
+    module.main()
+
+    monkeypatch.setenv("ADR2_OPERATION", "index")
     module.main()
 
     written = json.loads(context.index_path.read_text(encoding="utf-8"))

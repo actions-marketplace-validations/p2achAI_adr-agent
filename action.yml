@@ -1,6 +1,14 @@
-name: "ADR 2.0 Agent Promotion"
-description: "Promote AARs under configured docs/aar/ directories to ADRs under docs/adr/, update index.json (agent-friendly)."
+name: "ADR 2.0 Reconciliation"
+description: "Reconcile AARs with existing ADRs, consolidate duplicates, or deterministically generate indexes."
 inputs:
+  operation:
+    description: "Operation to run: reconcile, consolidate, or index"
+    required: false
+    default: "reconcile"
+  require_ownership:
+    description: "Fail when active ADRs lack valid ownership/domain metadata"
+    required: false
+    default: "false"
   llm_provider:
     description: "LLM provider to use: 'openai' or 'claude'"
     required: false
@@ -69,6 +77,8 @@ runs:
     - name: Generate ADRs from AARs
       shell: bash
       env:
+        ADR2_OPERATION: ${{ inputs.operation }}
+        ADR2_REQUIRE_OWNERSHIP: ${{ inputs.require_ownership }}
         LLM_PROVIDER: ${{ inputs.llm_provider }}
         OPENAI_API_KEY: ${{ inputs.openai_api_key }}
         OPENAI_MODEL: ${{ inputs.openai_model }}
@@ -77,7 +87,21 @@ runs:
         ADR2_REPO_ROOT: ${{ github.workspace }}
         ADR2_DOCS_DIRS: ${{ inputs.docs_dirs }}
         ADR2_LANGUAGE: ${{ inputs.language }}
+        ADR2_PR_BODY_PATH: ${{ runner.temp }}/adr2-pr-body.md
       run: python "$GITHUB_ACTION_PATH/scripts/adr2_agent_action.py"
+
+    - name: Prepare PR body
+      id: pr_body
+      shell: bash
+      env:
+        ADR2_DEFAULT_PR_BODY: ${{ inputs.pr_body }}
+        ADR2_PR_BODY_PATH: ${{ runner.temp }}/adr2-pr-body.md
+      run: |
+        {
+          echo 'body<<ADR2_BODY'
+          if [ -f "$ADR2_PR_BODY_PATH" ]; then cat "$ADR2_PR_BODY_PATH"; else printf '%s\n' "$ADR2_DEFAULT_PR_BODY"; fi
+          echo 'ADR2_BODY'
+        } >> "$GITHUB_OUTPUT"
 
     - name: Show ADR indexes
       if: always()
@@ -121,7 +145,7 @@ runs:
         commit-message: ${{ inputs.pr_title }}
         branch: ${{ inputs.pr_branch }}
         title: ${{ inputs.pr_title }}
-        body: ${{ inputs.pr_body }}
+        body: ${{ steps.pr_body.outputs.body }}
         base: ${{ inputs.pr_base }}
         delete-branch: true
         reviewers: ${{ inputs.reviewers }}

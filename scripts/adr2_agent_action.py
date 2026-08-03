@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-ADR 2.0 agent-focused promotion script.
+ADR 2.0 reconciliation script.
 
 This script is meant to be run inside CI (GitHub Actions) to:
-- Scan configured docs/aar/ directories for AAR files
-- Detect AARs that should be promoted to ADRs
-- Generate agent-friendly ADR markdown with structured front matter
-- Maintain configured docs/adr/index.json files so agents can quickly locate relevant ADRs
+- Reconcile AARs with existing ADRs
+- Backfill ownership and consolidate duplicate ADRs
+- Deterministically rebuild configured docs/adr/index.json files
 
 Requirements:
 - Set LLM_PROVIDER to 'openai' (default) or 'claude'.
@@ -16,13 +15,14 @@ Requirements:
 
 from __future__ import annotations
 
-import argparse
+import hashlib
 import json
 import os
 import re
+import shutil
 import sys
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
@@ -72,18 +72,6 @@ else:
     DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.1")
 
 DEFAULT_LANGUAGE = os.getenv("ADR2_LANGUAGE", "en")
-VALID_DECISION_SCOPES = {
-    "api-contract",
-    "architecture-boundary",
-    "data-governance",
-    "runtime-operations",
-    "security-trust",
-    "integration-contract",
-    "migration-compatibility",
-    "developer-platform",
-    "minor-change",
-}
-
 # ADR front matter `scope` values the generator is allowed to emit. The prompt
 # alone never held this contract, so new ADRs are coerced in code.
 VALID_ADR_SCOPES = (
@@ -100,6 +88,10 @@ DEFAULT_ADR_SCOPE = "architecture"
 DOMAINS_FILENAME = "domains.yml"
 TREE_FILENAME = "tree.json"
 UNCLASSIFIED_DOMAIN = "unclassified"
+INDEX_SCHEMA_VERSION = 2
+VALID_OPERATIONS = {"reconcile", "consolidate", "index"}
+VALID_RECONCILIATION_ACTIONS = {"covered", "amend", "create", "reject", "defer"}
+CONSOLIDATION_REPORT: List[str] = []
 
 # Agents load the tree root first, so it must stay small enough to be cheap.
 ROOT_PAYLOAD_LIMIT_BYTES = 5120
@@ -127,7 +119,7 @@ def format_id(number: int) -> str:
 
 
 def now_iso() -> str:
-    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def read_file(path: Path) -> str:
@@ -137,6 +129,75 @@ def read_file(path: Path) -> str:
 def write_file(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
+
+
+def render_front_matter_document(meta: Dict[str, Any], body: str) -> str:
+    yaml_output = yaml.dump(
+        meta,
+        Dumper=SafeYAMLDumper,
+        sort_keys=False,
+        allow_unicode=True,
+        default_flow_style=False,
+        width=float("inf"),
+    )
+    return f"---\n{yaml_output}---\n\n{body.lstrip()}"
+
+
+def merge_unique(existing: Iterable[Any], additions: Iterable[Any]) -> List[Any]:
+    merged: List[Any] = []
+    seen: set[str] = set()
+    for item in [*existing, *additions]:
+        key = json.dumps(item, ensure_ascii=False, sort_keys=True) if isinstance(item, (dict, list)) else str(item).strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            merged.append(item)
+    return merged
+
+
+def normalize_reconciliation_decision(value: Dict[str, Any]) -> Dict[str, Any]:
+    result = dict(value or {})
+    action = str(result.get("action") or "").strip().lower()
+    result["action"] = action if action in VALID_RECONCILIATION_ACTIONS else "defer"
+    return result
+
+
+def amend_existing_adr(path: Path, patch: Dict[str, Any]) -> None:
+    meta, body = parse_front_matter(path)
+    if not meta:
+        raise ValueError(f"Cannot amend ADR without front matter: {display_path(path)}")
+
+    addition = str(patch.get("decision_addition") or "").strip()
+    if addition and addition not in str(meta.get("decision") or ""):
+        meta["decision"] = " ".join(filter(None, [str(meta.get("decision") or "").strip(), addition]))
+
+    rules = normalize_string_list(meta.get("validation_rules"))
+    for replacement in patch.get("replace_validation_rules") or []:
+        if not isinstance(replacement, dict):
+            continue
+        existing = str(replacement.get("existing") or "").strip()
+        new = str(replacement.get("replacement") or "").strip()
+        if existing in rules and new:
+            rules[rules.index(existing)] = new
+    meta["validation_rules"] = merge_unique(rules, normalize_string_list(patch.get("add_validation_rules")))
+    meta["agent_playbook"] = merge_unique(
+        normalize_string_list(meta.get("agent_playbook")),
+        normalize_string_list(patch.get("add_agent_playbook")),
+    )
+    meta["index_terms"] = merge_unique(
+        normalize_string_list(meta.get("index_terms")),
+        normalize_string_list(patch.get("add_index_terms")),
+    )
+    for field in ("owns", "contracts"):
+        meta[field] = merge_unique(meta.get(field) or [], patch.get(f"add_{field}") or [])
+    if patch.get("applies_to"):
+        current = meta.get("applies_to") if isinstance(meta.get("applies_to"), dict) else {}
+        incoming = patch["applies_to"] if isinstance(patch["applies_to"], dict) else {}
+        meta["applies_to"] = {
+            "paths": merge_unique(current.get("paths") or [], incoming.get("paths") or []),
+            "symbols": merge_unique(current.get("symbols") or [], incoming.get("symbols") or []),
+        }
+    meta["updated_at"] = str(patch.get("updated_at") or now_iso())
+    write_file(path, render_front_matter_document(meta, body))
 
 
 def _quote_yaml_scalar(value: str) -> str:
@@ -234,6 +295,8 @@ def load_prompts() -> Dict[str, str]:
         "candidate": "adr-candidate-detect-prompt.md",
         "generate": "adr-generate-prompt.md",
         "rules": "validate-rule-prompt.md",
+        "ownership": "ownership-backfill-prompt.md",
+        "consolidate": "adr-consolidate-prompt.md",
     }
     for key, filename in names.items():
         for base in search_roots:
@@ -242,14 +305,6 @@ def load_prompts() -> Dict[str, str]:
                 prompts[key] = read_file(path)
                 break
     return prompts
-
-
-@dataclass
-class ADRCandidate:
-    path: Path
-    scope: str
-    detection: Dict
-    adr_payload: Dict
 
 
 @dataclass(frozen=True)
@@ -658,58 +713,6 @@ def call_openai_json_object(
     return {}
 
 
-def normalize_candidate_decision(detection: Dict[str, Any]) -> Tuple[bool, str]:
-    """Interpret detector output conservatively."""
-    raw_candidate = detection.get("isCandidate")
-    decision_scope = (detection.get("decisionScope") or "").strip()
-
-    is_candidate = raw_candidate is True
-    if not is_candidate:
-        return False, decision_scope
-
-    if decision_scope not in VALID_DECISION_SCOPES:
-        return False, decision_scope
-
-    if decision_scope == "minor-change":
-        return False, decision_scope
-
-    return True, decision_scope
-
-
-def call_openai_json_value(
-    system_prompt: str,
-    user_content: str,
-    model: str = DEFAULT_MODEL,
-    *,
-    instructions: str | None = None,
-) -> Any:
-    base_messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_content},
-    ]
-    last_content = ""
-    for attempt in range(MAX_MODEL_ATTEMPTS):
-        messages = list(base_messages)
-        if attempt > 0:
-            messages.append(
-                {
-                    "role": "user",
-                    "content": "Return ONLY valid JSON (no prose, no markdown).",
-                }
-            )
-        last_content = call_llm_text(
-            model=model, messages=messages, instructions=instructions
-        )
-        try:
-            return parse_json_from_text(last_content)
-        except Exception:
-            if attempt == MAX_MODEL_ATTEMPTS - 1:
-                raise RuntimeError(
-                    f"Failed to parse JSON from model response: {last_content}"
-                )
-    return None
-
-
 def maybe_add_agentic_working_notes(aar_text: str) -> str:
     """멀티패스(선-분석 후-생성)로 모델 추론을 유도."""
 
@@ -729,58 +732,6 @@ def maybe_add_agentic_working_notes(aar_text: str) -> str:
     )
 
 
-def detect_candidates(
-    prompts: Dict[str, str],
-    context: DocsContext,
-) -> Tuple[List[Tuple[Path, Dict]], List[Path]]:
-    aar_paths = []
-    if context.aar_dir.exists():
-        for path in context.aar_dir.rglob("*.md"):
-            aar_paths.append(path)
-    else:
-        log(f"{display_path(context.aar_dir)} not found; skipping AAR scan.")
-        return [], []
-
-    log(
-        f"Discovered {len(aar_paths)} AAR markdown file(s) under {display_path(context.aar_dir)}/."
-    )
-
-    if not aar_paths:
-        return [], []
-
-    if "candidate" not in prompts:
-        raise RuntimeError("Candidate detection prompt missing.")
-
-    candidates = []
-    non_candidates = []
-    instructions = prompts.get("adr2", "")
-    system_prompt = prompts["candidate"]
-    for path in aar_paths:
-        aar_text = read_file(path)
-        detection = call_openai_json_object(
-            system_prompt,
-            maybe_add_agentic_working_notes(aar_text),
-            instructions=instructions,
-        )
-        is_candidate, decision_scope = normalize_candidate_decision(detection)
-        if is_candidate:
-            log(
-                f"Candidate detected: {path} (scope={decision_scope or detection.get('decisionScope')})"
-            )
-            candidates.append((path, detection))
-        else:
-            reason = ""
-            if detection.get("isCandidate") is not True:
-                reason = f" (isCandidate={detection.get('isCandidate')!r})"
-            elif decision_scope == "minor-change":
-                reason = " (scope=minor-change)"
-            elif decision_scope not in VALID_DECISION_SCOPES:
-                reason = f" (invalid scope={decision_scope!r})"
-            log(f"Non-candidate: {path}{reason}")
-            non_candidates.append(path)
-    return candidates, non_candidates
-
-
 def build_generator_prompt(
     prompts: Dict[str, str], domains: List[Domain] | None = None
 ) -> str:
@@ -793,7 +744,7 @@ def build_generator_prompt(
         "Return ONLY a JSON object with keys:"
         ' {"title","scope","decision","context","rationale",'
         '"alternatives","consequences","validation_rules","agent_playbook",'
-        f'"agent_signals","related_suggestions","index_terms",{domain_key}}}. '
+        f'"agent_signals","related_suggestions","index_terms","owns","contracts","applies_to",{domain_key}}}. '
         "Use short, declarative language for agents. "
         'Scope must be one of ["architecture","infrastructure","data-model","api","component"]. '
         "Alternatives and consequences must be arrays. "
@@ -802,6 +753,8 @@ def build_generator_prompt(
         "agent_signals must include importance (high/medium/low) and enforcement (must/should/monitor). "
         "related_suggestions is an array of titles/phrases that may match other ADRs. "
         "index_terms is an array of 3-7 short keywords for retrieval. "
+        "owns is an array of {type,key} authoritative boundaries. contracts is an array of {id,role} entries. "
+        "applies_to is an object with paths and symbols arrays; omit unsupported paths or symbols. "
         "Do not include markdown or prose outside of the JSON object."
     )
     if domains:
@@ -1020,6 +973,12 @@ def render_adr(markup: Dict, body: Dict) -> str:
             "updated_at": markup["updated_at"],
             "decision": markup["decision"],
             "related": markup.get("related", []),
+            "owns": markup.get("owns", []),
+            "contracts": markup.get("contracts", []),
+            "applies_to": markup.get("applies_to", {}),
+            "relations": markup.get(
+                "relations", {"related": markup.get("related", []), "depends_on": [], "supersedes": []}
+            ),
             "validation_rules": validation_rules,
             "agent_playbook": agent_playbook,
             "agent_signals": agent_signals,
@@ -1074,11 +1033,16 @@ def catalog_existing_adrs(context: DocsContext) -> List[Dict]:
                 "scope": meta.get("scope"),
                 "domain": meta.get("domain"),
                 "related": meta.get("related", []),
+                "relations": meta.get("relations", {}),
+                "owns": meta.get("owns", []),
+                "contracts": meta.get("contracts", []),
+                "applies_to": meta.get("applies_to", {}),
                 "validation_rules": meta.get("validation_rules", []),
                 "agent_playbook": meta.get("agent_playbook", []),
                 "agent_signals": meta.get("agent_signals", {}),
                 "path": display_path(path),
                 "decision": meta.get("decision"),
+                "created_at": meta.get("created_at"),
                 "index_terms": meta.get("index_terms", []),
                 "updated_at": meta.get("updated_at"),
             }
@@ -1086,7 +1050,76 @@ def catalog_existing_adrs(context: DocsContext) -> List[Dict]:
     return catalog
 
 
-def write_index(catalog: List[Dict], context: DocsContext) -> None:
+def catalog_superseded_ids(context: DocsContext) -> set[str]:
+    ids: set[str] = set()
+    for path in (context.adr_dir / "superseded").glob("*.md"):
+        meta, _ = parse_front_matter(path)
+        if meta.get("id"):
+            ids.add(str(meta["id"]))
+    return ids
+
+
+def validate_catalog(
+    catalog: List[Dict],
+    *,
+    require_ownership: bool = False,
+    superseded_ids: Iterable[str] = (),
+) -> List[str]:
+    errors: List[str] = []
+    active_ids = {str(item.get("id") or "") for item in catalog}
+    valid_relation_ids = active_ids | {str(value) for value in superseded_ids}
+    owners: Dict[tuple[str, str], str] = {}
+    producers: Dict[str, str] = {}
+
+    for item in catalog:
+        adr_id = str(item.get("id") or "<unknown>")
+        if require_ownership and not ownership_keys(item):
+            errors.append(f"{adr_id}: ownership is required")
+        if require_ownership and str(item.get("domain") or "") in ("", UNCLASSIFIED_DOMAIN):
+            errors.append(f"{adr_id}: valid domain is required")
+
+        for owner in ownership_keys(item):
+            previous = owners.setdefault(owner, adr_id)
+            if previous != adr_id:
+                errors.append(f"ownership {owner[0]}:{owner[1]} is duplicated by {previous} and {adr_id}")
+
+        for contract in item.get("contracts") or []:
+            if not isinstance(contract, dict) or str(contract.get("role") or "").lower() != "producer":
+                continue
+            contract_id = str(contract.get("id") or "").strip()
+            if not contract_id:
+                continue
+            previous = producers.setdefault(contract_id, adr_id)
+            if previous != adr_id:
+                errors.append(f"contract producer {contract_id} is duplicated by {previous} and {adr_id}")
+
+        relations = item.get("relations") if isinstance(item.get("relations"), dict) else {}
+        for relation in ("related", "depends_on", "supersedes"):
+            for target in normalize_string_list(relations.get(relation)):
+                if target not in valid_relation_ids:
+                    errors.append(f"{adr_id}: broken {relation} relation to {target}")
+    return errors
+
+
+def validate_contract_producers(catalogs: Iterable[List[Dict]]) -> List[str]:
+    errors: List[str] = []
+    producers: Dict[str, str] = {}
+    for catalog in catalogs:
+        for item in catalog:
+            label = str(item.get("id") or item.get("path") or "<unknown>")
+            for contract in item.get("contracts") or []:
+                if not isinstance(contract, dict) or str(contract.get("role") or "").lower() != "producer":
+                    continue
+                contract_id = str(contract.get("id") or "").strip()
+                if not contract_id:
+                    continue
+                previous = producers.setdefault(contract_id, label)
+                if previous != label:
+                    errors.append(f"contract producer {contract_id} is duplicated by {previous} and {label}")
+    return errors
+
+
+def build_index_payload(catalog: List[Dict]) -> Dict[str, Any]:
     def summarize(decision: str | None) -> str:
         if not decision:
             return ""
@@ -1106,8 +1139,14 @@ def write_index(catalog: List[Dict], context: DocsContext) -> None:
             {
                 "path": item.get("path"),
                 "related": item.get("related", []),
+                "relations": item.get("relations", {}),
+                "owns": item.get("owns", []),
+                "contracts": item.get("contracts", []),
+                "applies_to": item.get("applies_to", {}),
                 "index_terms": item.get("index_terms", []),
                 "decision_summary": summarize(item.get("decision")),
+                "validation_rules": item.get("validation_rules", []),
+                "agent_playbook": item.get("agent_playbook", []),
                 "agent_signals": item.get("agent_signals", {}),
                 "updated_at": item.get("updated_at"),
             }
@@ -1115,6 +1154,19 @@ def write_index(catalog: List[Dict], context: DocsContext) -> None:
         thin_items.append(thin_item)
 
     items = sorted(thin_items, key=lambda c: c.get("id", ""))
+    source = json.dumps(items, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    updated = sorted(str(item.get("updated_at") or "") for item in items)
+    return {
+        "schema_version": INDEX_SCHEMA_VERSION,
+        "source_hash": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+        "generated_at": updated[-1] if updated else "",
+        "count": len(items),
+        "items": items,
+    }
+
+
+def write_index(catalog: List[Dict], context: DocsContext) -> None:
+    payload = build_index_payload(catalog)
 
     # Regenerating unconditionally (see main()) means most runs find zero
     # drift. Rewriting the file anyway would still bump generated_at every
@@ -1126,21 +1178,418 @@ def write_index(catalog: List[Dict], context: DocsContext) -> None:
             existing = json.loads(read_file(context.index_path))
         except (json.JSONDecodeError, OSError):
             existing = None
-        if isinstance(existing, dict) and existing.get("items") == items:
+        if existing == payload:
             log(f"Index unchanged at {context.index_path}; skipping rewrite.")
             return
-
-    payload = {
-        "generated_at": now_iso(),
-        "count": len(items),
-        "items": items,
-    }
     write_file(context.index_path, json.dumps(payload, indent=2, ensure_ascii=False))
-    log(f"Index updated with {len(items)} entries at {context.index_path}")
+    log(f"Index updated with {len(payload['items'])} entries at {context.index_path}")
+
+
+def consolidate_adr_files(context: DocsContext, canonical_path: Path, duplicate_paths: List[Path]) -> None:
+    canonical, body = parse_front_matter(canonical_path)
+    if not canonical:
+        raise ValueError(f"Canonical ADR has no front matter: {display_path(canonical_path)}")
+    relations = canonical.get("relations") if isinstance(canonical.get("relations"), dict) else {}
+    supersedes = normalize_string_list(relations.get("supersedes"))
+
+    for duplicate_path in duplicate_paths:
+        duplicate, _ = parse_front_matter(duplicate_path)
+        if not duplicate:
+            raise ValueError(f"Duplicate ADR has no front matter: {display_path(duplicate_path)}")
+        for field in ("validation_rules", "agent_playbook", "index_terms", "owns", "contracts"):
+            canonical[field] = merge_unique(canonical.get(field) or [], duplicate.get(field) or [])
+        duplicate_decision = str(duplicate.get("decision") or "").strip()
+        if duplicate_decision and duplicate_decision not in str(canonical.get("decision") or ""):
+            canonical["decision"] = " ".join(
+                filter(None, [str(canonical.get("decision") or "").strip(), duplicate_decision])
+            )
+        duplicate_relations = duplicate.get("relations") if isinstance(duplicate.get("relations"), dict) else {}
+        for relation in ("related", "depends_on"):
+            relations[relation] = merge_unique(
+                relations.get(relation) or [], duplicate_relations.get(relation) or duplicate.get(relation) or []
+            )
+        supersedes = merge_unique(supersedes, [duplicate.get("id"), *normalize_string_list(duplicate_relations.get("supersedes"))])
+        destination = context.adr_dir / "superseded" / duplicate_path.name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(duplicate_path), str(destination))
+
+    relations["related"] = relations.get("related") or []
+    relations["depends_on"] = relations.get("depends_on") or []
+    relations["supersedes"] = supersedes
+    canonical["relations"] = relations
+    canonical["updated_at"] = now_iso()
+    write_file(canonical_path, render_front_matter_document(canonical, body))
+
+
+def ownership_keys(value: Dict[str, Any]) -> set[tuple[str, str]]:
+    keys: set[tuple[str, str]] = set()
+    for item in value.get("owns") or []:
+        if not isinstance(item, dict):
+            continue
+        owner_type = str(item.get("type") or "").strip().lower()
+        key = str(item.get("key") or "").strip().lower()
+        if owner_type and key:
+            keys.add((owner_type, key))
+    return keys
+
+
+def _search_tokens(value: Any) -> set[str]:
+    return {
+        token.lower()
+        for token in re.findall(r"[A-Za-z0-9가-힣_]+", stringify(value))
+        if len(token) > 1
+    }
+
+
+def shortlist_existing_adrs(aar_text: str, catalog: List[Dict], limit: int = 8) -> List[Dict]:
+    query = _search_tokens(aar_text)
+    ranked: List[tuple[int, Dict]] = []
+    for item in catalog:
+        searchable = {
+            "title": item.get("title"),
+            "domain": item.get("domain"),
+            "decision": item.get("decision"),
+            "index_terms": item.get("index_terms"),
+            "owns": item.get("owns"),
+            "contracts": item.get("contracts"),
+            "applies_to": item.get("applies_to"),
+            "validation_rules": item.get("validation_rules"),
+            "relations": item.get("relations"),
+        }
+        score = len(query & _search_tokens(searchable))
+        if score:
+            ranked.append((score, item))
+    ranked.sort(key=lambda pair: (-pair[0], str(pair[1].get("id") or "")))
+    selected = [item for _, item in ranked[:limit]]
+    selected_ids = {item.get("id") for item in selected}
+    by_id = {item.get("id"): item for item in catalog}
+    for item in list(selected):
+        relations = item.get("relations") if isinstance(item.get("relations"), dict) else {}
+        related = [*normalize_string_list(item.get("related")), *normalize_string_list(relations.get("related")), *normalize_string_list(relations.get("depends_on"))]
+        for adr_id in related:
+            if adr_id in by_id and adr_id not in selected_ids and len(selected) < limit:
+                selected.append(by_id[adr_id])
+                selected_ids.add(adr_id)
+    minimum = min(5, len(catalog), limit)
+    if len(selected) < minimum:
+        for item in sorted(catalog, key=lambda value: str(value.get("id") or "")):
+            if item.get("id") not in selected_ids:
+                selected.append(item)
+                selected_ids.add(item.get("id"))
+            if len(selected) >= minimum:
+                break
+    return selected
+
+
+def reconciliation_decision(prompts: Dict[str, str], aar_text: str, catalog: List[Dict]) -> Dict[str, Any]:
+    candidates = shortlist_existing_adrs(aar_text, catalog)
+    user_content = json.dumps(
+        {
+            "aar": aar_text,
+            "existing_adr_candidates": candidates,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    return normalize_reconciliation_decision(
+        call_openai_json_object(
+            prompts["candidate"],
+            user_content,
+            instructions=prompts.get("adr2", ""),
+        )
+    )
+
+
+def create_adr_from_aar(
+    prompts: Dict[str, str],
+    context: DocsContext,
+    aar_text: str,
+    catalog: List[Dict],
+    domains: List[Domain],
+    scope_hint: str,
+) -> Dict[str, Any] | None:
+    payload = generate_adr_payload(prompts, aar_text, scope_hint, domains)
+    maybe_enrich_validation_rules(prompts, payload)
+    payload["alternatives"] = normalize_string_list(payload.get("alternatives"))
+    payload["consequences"] = normalize_string_list(payload.get("consequences"))
+    payload["validation_rules"] = normalize_string_list(payload.get("validation_rules"))
+    payload["agent_playbook"] = normalize_string_list(payload.get("agent_playbook"))
+    payload["index_terms"] = canonicalize_index_terms(
+        payload.get("index_terms"), build_index_term_canonical_map(catalog)
+    )
+    payload["owns"] = payload.get("owns") or []
+    payload["contracts"] = payload.get("contracts") or []
+    payload["applies_to"] = payload.get("applies_to") or {}
+    proposed_keys = ownership_keys(payload)
+    if not proposed_keys:
+        log("Deferred create because ownership metadata is missing.")
+        return None
+    if any(proposed_keys & ownership_keys(item) for item in catalog):
+        log("Deferred create because an existing ADR owns the same boundary.")
+        return None
+
+    adr_id = next_adr_id(catalog)
+    related_ids = resolve_related(payload.get("related_suggestions", []), catalog)
+    domain = resolve_domain(payload, domains, proposed=payload.get("domain"))
+    now = now_iso()
+    markup = {
+        "id": adr_id,
+        "title": payload.get("title", adr_id),
+        "scope": normalize_adr_scope(payload.get("scope", scope_hint)),
+        "domain": domain,
+        "created_at": now,
+        "updated_at": now,
+        "decision": str(payload.get("decision") or "").strip(),
+        "related": related_ids,
+        "owns": payload["owns"],
+        "contracts": payload["contracts"],
+        "applies_to": payload["applies_to"],
+        "relations": {"related": related_ids, "depends_on": [], "supersedes": []},
+        "validation_rules": payload["validation_rules"],
+        "agent_playbook": payload["agent_playbook"],
+        "agent_signals": payload.get("agent_signals") or {"importance": "medium", "enforcement": "should"},
+        "index_terms": payload["index_terms"],
+    }
+    path = context.adr_dir / f"{adr_id}-{slugify(markup['title'])}.md"
+    write_file(path, render_adr(markup, payload))
+    log(f"Generated ADR {adr_id} -> {path}")
+    entry = dict(markup)
+    entry["path"] = display_path(path)
+    return entry
+
+
+def reconcile_context(prompts: Dict[str, str], context: DocsContext, catalog: List[Dict], domains: List[Domain]) -> bool:
+    if not context.aar_dir.exists():
+        return False
+    processed = False
+    by_id = {str(item.get("id")): item for item in catalog}
+    for aar_path in sorted(context.aar_dir.rglob("*.md")):
+        aar_text = read_file(aar_path)
+        decision = reconciliation_decision(prompts, aar_text, catalog)
+        action = decision["action"]
+        log(f"Reconciliation {action}: {display_path(aar_path)}")
+        if action == "defer":
+            continue
+        if action == "covered":
+            target_id = str(decision.get("target_adr_id") or "")
+            if target_id not in by_id:
+                log(f"Deferred covered because target ADR was not found: {target_id!r}")
+                continue
+        if action == "amend":
+            target_id = str(decision.get("target_adr_id") or "")
+            target = by_id.get(target_id)
+            if not target:
+                log(f"Deferred amend because target ADR was not found: {target_id!r}")
+                continue
+            amend_existing_adr(resolve_repo_path(str(target["path"])), decision)
+        elif action == "create":
+            created = create_adr_from_aar(
+                prompts,
+                context,
+                aar_text,
+                catalog,
+                domains,
+                str(decision.get("decision_scope") or DEFAULT_ADR_SCOPE),
+            )
+            if created is None:
+                continue
+            catalog.append(created)
+            by_id[str(created["id"])] = created
+        aar_path.unlink()
+        processed = True
+    return processed
+
+
+def _metadata_from_path(path: Path) -> Dict[str, Any]:
+    meta, _ = parse_front_matter(path)
+    return meta
+
+
+def backfill_ownership(prompts: Dict[str, str], catalog: List[Dict], domains: List[Domain]) -> bool:
+    changed = False
+    for item in catalog:
+        needs_ownership = not ownership_keys(item)
+        resolved_domain = resolve_domain(item, domains, item.get("domain")) if domains else ""
+        needs_domain = bool(domains) and normalize_domain(item.get("domain"), domains) is None
+        if not needs_ownership and not needs_domain:
+            continue
+        path = resolve_repo_path(str(item["path"]))
+        meta, body = parse_front_matter(path)
+        if needs_ownership:
+            proposed = call_openai_json_object(
+                prompts["ownership"],
+                json.dumps(meta, ensure_ascii=False, indent=2),
+                instructions=prompts.get("adr2", ""),
+            )
+            owns = [entry for entry in proposed.get("owns") or [] if isinstance(entry, dict)]
+            if not owns:
+                log(f"Ownership backfill deferred: {item.get('id')}")
+                continue
+            meta["owns"] = owns
+            meta["contracts"] = [entry for entry in proposed.get("contracts") or [] if isinstance(entry, dict)]
+            applies = proposed.get("applies_to") if isinstance(proposed.get("applies_to"), dict) else {}
+            meta["applies_to"] = {
+                "paths": normalize_string_list(applies.get("paths")),
+                "symbols": normalize_string_list(applies.get("symbols")),
+            }
+        if domains:
+            meta["domain"] = resolve_domain(meta, domains, meta.get("domain"))
+        current_relations = meta.get("relations") if isinstance(meta.get("relations"), dict) else {}
+        meta["relations"] = {
+            "related": merge_unique(current_relations.get("related") or [], meta.get("related") or []),
+            "depends_on": normalize_string_list(current_relations.get("depends_on")),
+            "supersedes": normalize_string_list(current_relations.get("supersedes")),
+        }
+        write_file(path, render_front_matter_document(meta, body))
+        item.update(
+            {
+                "owns": meta["owns"],
+                "contracts": meta["contracts"],
+                "applies_to": meta["applies_to"],
+                "relations": meta["relations"],
+                "domain": meta.get("domain"),
+            }
+        )
+        changed = True
+    return changed
+
+
+def ownership_clusters(catalog: List[Dict]) -> List[List[Dict]]:
+    parents = list(range(len(catalog)))
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            parents[right_root] = left_root
+
+    owners: Dict[tuple[str, str], int] = {}
+    producers: Dict[str, int] = {}
+    for index, item in enumerate(catalog):
+        for key in ownership_keys(item):
+            if key in owners:
+                union(index, owners[key])
+            else:
+                owners[key] = index
+        for contract in item.get("contracts") or []:
+            if not isinstance(contract, dict) or str(contract.get("role") or "").lower() != "producer":
+                continue
+            contract_id = str(contract.get("id") or "").strip().lower()
+            if contract_id in producers:
+                union(index, producers[contract_id])
+            elif contract_id:
+                producers[contract_id] = index
+
+    grouped: Dict[int, List[Dict]] = {}
+    for index, item in enumerate(catalog):
+        grouped.setdefault(find(index), []).append(item)
+    return [items for items in grouped.values() if len(items) > 1]
+
+
+def select_canonical(cluster: List[Dict], catalog: List[Dict]) -> Dict:
+    referenced = {
+        item.get("id"): sum(
+            item.get("id") in normalize_string_list(other.get("related"))
+            or item.get("id") in normalize_string_list((other.get("relations") or {}).get("related"))
+            for other in catalog
+        )
+        for item in cluster
+    }
+
+    def rank(item: Dict) -> tuple:
+        relations = item.get("relations") if isinstance(item.get("relations"), dict) else {}
+        return (
+            -bool(relations.get("supersedes")),
+            -referenced.get(item.get("id"), 0),
+            -len(item.get("validation_rules") or []),
+            str(item.get("created_at") or "9999"),
+            str(item.get("id") or ""),
+        )
+
+    return sorted(cluster, key=rank)[0]
+
+
+def consolidate_context(prompts: Dict[str, str], context: DocsContext, catalog: List[Dict], domains: List[Domain]) -> bool:
+    changed = backfill_ownership(prompts, catalog, domains)
+    for cluster in ownership_clusters(catalog):
+        judgement = call_openai_json_object(
+            prompts["consolidate"],
+            json.dumps(cluster, ensure_ascii=False, indent=2),
+            instructions=prompts.get("adr2", ""),
+        )
+        merge_allowed = all(
+            (
+                judgement.get("merge") is True,
+                judgement.get("same_authoritative_boundary") is True,
+                judgement.get("same_validation_responsibility") is True,
+                judgement.get("independent_lifecycle") is False,
+                judgement.get("independent_rollback") is False,
+            )
+        )
+        if not merge_allowed:
+            log(f"Kept ownership cluster separate: {[item.get('id') for item in cluster]}")
+            CONSOLIDATION_REPORT.append(
+                f"- 독립 유지: {', '.join(str(item.get('id')) for item in cluster)}\n"
+                f"  - 이유: {str(judgement.get('reason') or '책임 또는 lifecycle/rollback 경계가 독립적임')}"
+            )
+            continue
+        canonical = select_canonical(cluster, catalog)
+        retired = [item for item in cluster if item.get("id") != canonical.get("id")]
+        canonical_path = resolve_repo_path(str(canonical["path"]))
+        duplicate_paths = [
+            resolve_repo_path(str(item["path"])) for item in retired
+        ]
+        consolidate_adr_files(context, canonical_path, duplicate_paths)
+        log(f"Consolidated {[item.get('id') for item in cluster]} into {canonical.get('id')}")
+        preserved_rules = merge_unique([], [rule for item in retired for rule in item.get("validation_rules") or []])
+        CONSOLIDATION_REPORT.append(
+            f"- canonical: {canonical.get('id')}\n"
+            f"  - retired: {', '.join(str(item.get('id')) for item in retired)}\n"
+            f"  - 통합 이유: {str(judgement.get('reason') or 'authoritative boundary와 validation 책임이 일치함')}\n"
+            f"  - 보존 규칙: {', '.join(str(rule) for rule in preserved_rules) or '없음'}\n"
+            "  - 교체 규칙: 없음"
+        )
+        changed = True
+    return changed
 
 
 def main() -> None:
     PARSE_FAILURES.clear()
+    CONSOLIDATION_REPORT.clear()
+    operation = str(os.getenv("ADR2_OPERATION") or "reconcile").strip().lower()
+    require_ownership = str(os.getenv("ADR2_REQUIRE_OWNERSHIP") or "false").lower() in {"1", "true", "yes"}
+    if operation not in VALID_OPERATIONS:
+        raise SystemExit(f"ADR2_OPERATION must be one of {sorted(VALID_OPERATIONS)}")
+
+    if operation == "index":
+        log(f"Repo root: {ROOT}")
+        log("Operation: index")
+        indexed: List[tuple[DocsContext, List[Dict]]] = []
+        for context in resolve_docs_contexts():
+            catalog = catalog_existing_adrs(context)
+            errors = validate_catalog(
+                catalog,
+                require_ownership=require_ownership,
+                superseded_ids=catalog_superseded_ids(context),
+            )
+            if errors:
+                raise RuntimeError("Invalid ADR catalog:\n- " + "\n- ".join(errors))
+            indexed.append((context, catalog))
+        producer_errors = validate_contract_producers(catalog for _, catalog in indexed)
+        if producer_errors:
+            raise RuntimeError("Invalid ADR catalog:\n- " + "\n- ".join(producer_errors))
+        for context, catalog in indexed:
+            write_index(catalog, context)
+        if PARSE_FAILURES:
+            raise RuntimeError(
+                f"{len(PARSE_FAILURES)} ADR file(s) failed front matter parsing; fix them before indexing."
+            )
+        return
 
     if LLM_PROVIDER == "claude":
         if not os.getenv("ANTHROPIC_API_KEY"):
@@ -1155,111 +1604,43 @@ def main() -> None:
     if "adr2" not in prompts:
         raise SystemExit("README.md prompt (adr2) is required.")
     log(f"Repo root: {ROOT}")
+    log(f"Operation: {operation}")
     log(f"Language: {DEFAULT_LANGUAGE}")
     log("Agentic reasoning: on")
     processed_any = False
 
+    resulting_catalogs: List[List[Dict]] = []
     for context in resolve_docs_contexts():
         log(f"Docs dir: {display_path(context.docs_dir)}")
         catalog = catalog_existing_adrs(context)
         log(f"Loaded catalog with {len(catalog)} existing ADR(s).")
-        index_term_canonical_map = build_index_term_canonical_map(catalog)
         domains = load_domains(context)
         if domains:
             log(f"Loaded {len(domains)} domain(s) from {display_path(context.domains_path)}.")
-
-        detections, non_candidates = detect_candidates(prompts, context)
-        non_candidate_deletions: set[Path] = set()
-        candidate_deletions: set[Path] = set()
-        new_catalog_entries: List[Dict] = []
-
-        if not detections and not non_candidates:
-            log("No ADR candidates found; index will still be regenerated from disk.")
+        if operation == "reconcile":
+            processed_any = reconcile_context(prompts, context, catalog, domains) or processed_any
         else:
-            processed_any = True
-            for path, detection in detections:
-                scope_hint = detection.get("decisionScope", "architecture")
-                aar_text = read_file(path)
-                payload = generate_adr_payload(prompts, aar_text, scope_hint, domains)
-                maybe_enrich_validation_rules(prompts, payload)
-                payload["alternatives"] = normalize_string_list(payload.get("alternatives"))
-                payload["consequences"] = normalize_string_list(payload.get("consequences"))
-                payload["validation_rules"] = normalize_string_list(payload.get("validation_rules"))
-                payload["agent_playbook"] = normalize_string_list(payload.get("agent_playbook"))
-                payload["index_terms"] = canonicalize_index_terms(
-                    payload.get("index_terms"), index_term_canonical_map
-                )
-                if not isinstance(payload.get("agent_signals"), dict):
-                    payload["agent_signals"] = {"importance": "medium", "enforcement": "should"}
+            processed_any = consolidate_context(prompts, context, catalog, domains) or processed_any
+        resulting_catalog = catalog_existing_adrs(context)
+        errors = validate_catalog(
+            resulting_catalog,
+            require_ownership=require_ownership,
+            superseded_ids=catalog_superseded_ids(context),
+        )
+        if errors:
+            raise RuntimeError("Invalid ADR catalog:\n- " + "\n- ".join(errors))
+        resulting_catalogs.append(resulting_catalog)
 
-                adr_id = next_adr_id(catalog + new_catalog_entries)
-                slug = slugify(payload.get("title", adr_id))
-                adr_filename = f"{adr_id}-{slug}.md"
-                adr_path = context.adr_dir / adr_filename
-
-                related_ids = resolve_related(
-                    payload.get("related_suggestions", []), catalog + new_catalog_entries
-                )
-                domain = resolve_domain(payload, domains, proposed=payload.get("domain"))
-                if domain == UNCLASSIFIED_DOMAIN:
-                    log(f"WARNING: domain unclassified for {adr_id} ({payload.get('title', '')!r}).")
-
-                markup = {
-                    "id": adr_id,
-                    "title": payload.get("title", adr_id),
-                    "scope": normalize_adr_scope(payload.get("scope", scope_hint)),
-                    "domain": domain,
-                    "created_at": now_iso(),
-                    "updated_at": now_iso(),
-                    "decision": payload.get("decision", "").strip(),
-                    "related": related_ids,
-                    "validation_rules": payload.get("validation_rules", []),
-                    "agent_playbook": payload.get("agent_playbook", []),
-                    "agent_signals": payload.get(
-                        "agent_signals", {"importance": "medium", "enforcement": "should"}
-                    ),
-                    "index_terms": payload.get("index_terms", []),
-                }
-
-                content = render_adr(markup, payload)
-                write_file(adr_path, content)
-
-                catalog_entry = {
-                    "id": adr_id,
-                    "title": markup["title"],
-                    "scope": markup["scope"],
-                    "domain": markup["domain"],
-                    "related": related_ids,
-                    "validation_rules": markup["validation_rules"],
-                    "path": display_path(adr_path),
-                    "decision": markup["decision"],
-                    "agent_playbook": markup["agent_playbook"],
-                    "agent_signals": markup["agent_signals"],
-                    "index_terms": markup["index_terms"],
-                    "updated_at": markup["updated_at"],
-                }
-                new_catalog_entries.append(catalog_entry)
-                log(f"Generated ADR {adr_id} -> {adr_path}")
-                candidate_deletions.add(path)
-
-            # delete non-candidates and processed candidates
-            to_delete = set(non_candidates) | non_candidate_deletions | candidate_deletions
-            for path in to_delete:
-                try:
-                    path.unlink()
-                    log(f"Deleted AAR: {path}")
-                except Exception as exc:  # pragma: no cover - filesystem issue
-                    log(f"Failed to delete AAR {path}: {exc}")
-
-        # Always regenerate the index from what is on disk, even when there are
-        # no AAR promotion candidates this run. Otherwise manual edits to
-        # existing ADR files (or their removal) never get absorbed until the
-        # next promotion happens to fire, which can be an arbitrarily long time.
-        full_catalog = catalog + new_catalog_entries
-        write_index(full_catalog, context)
+    producer_errors = validate_contract_producers(resulting_catalogs)
+    if producer_errors:
+        raise RuntimeError("Invalid ADR catalog:\n- " + "\n- ".join(producer_errors))
 
     if not processed_any:
         log("No ADR candidates found in any configured docs dir.")
+
+    if operation == "consolidate" and os.getenv("ADR2_PR_BODY_PATH"):
+        report = "# ADR 통합 결과\n\n" + ("\n".join(CONSOLIDATION_REPORT) or "통합 또는 독립 유지 판정 대상이 없습니다.") + "\n"
+        write_file(Path(os.environ["ADR2_PR_BODY_PATH"]), report)
 
     if PARSE_FAILURES:
         log(f"ERROR: {len(PARSE_FAILURES)} ADR file(s) failed front matter parsing:")
