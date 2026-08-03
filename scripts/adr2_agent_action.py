@@ -1514,6 +1514,27 @@ def select_canonical(cluster: List[Dict], catalog: List[Dict]) -> Dict:
     return sorted(cluster, key=rank)[0]
 
 
+def apply_ownership_updates(cluster: List[Dict], updates: Any) -> bool:
+    by_id = {str(item.get("id")): item for item in cluster}
+    changed = False
+    for update in updates if isinstance(updates, list) else []:
+        if not isinstance(update, dict):
+            continue
+        item = by_id.get(str(update.get("adr_id") or ""))
+        owns = [value for value in update.get("owns") or [] if isinstance(value, dict)]
+        if not item or not owns:
+            continue
+        path = resolve_repo_path(str(item["path"]))
+        meta, body = parse_front_matter(path)
+        meta["owns"] = owns
+        meta["contracts"] = [value for value in update.get("contracts") or [] if isinstance(value, dict)]
+        write_file(path, render_front_matter_document(meta, body))
+        item["owns"] = meta["owns"]
+        item["contracts"] = meta["contracts"]
+        changed = True
+    return changed
+
+
 def consolidate_context(prompts: Dict[str, str], context: DocsContext, catalog: List[Dict], domains: List[Domain]) -> bool:
     changed = backfill_ownership(prompts, catalog, domains)
     for cluster in ownership_clusters(catalog):
@@ -1532,11 +1553,14 @@ def consolidate_context(prompts: Dict[str, str], context: DocsContext, catalog: 
             )
         )
         if not merge_allowed:
+            reclassified = apply_ownership_updates(cluster, judgement.get("ownership_updates"))
             log(f"Kept ownership cluster separate: {[item.get('id') for item in cluster]}")
             CONSOLIDATION_REPORT.append(
                 f"- 독립 유지: {', '.join(str(item.get('id')) for item in cluster)}\n"
-                f"  - 이유: {str(judgement.get('reason') or '책임 또는 lifecycle/rollback 경계가 독립적임')}"
+                f"  - 이유: {str(judgement.get('reason') or '책임 또는 lifecycle/rollback 경계가 독립적임')}\n"
+                f"  - ownership 재분류: {'완료' if reclassified else '없음'}"
             )
+            changed = reclassified or changed
             continue
         canonical = select_canonical(cluster, catalog)
         retired = [item for item in cluster if item.get("id") != canonical.get("id")]

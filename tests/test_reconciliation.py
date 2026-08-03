@@ -310,6 +310,44 @@ def test_consolidate_operation_backfills_ownership_and_merges_judged_duplicates(
     assert "보존 규칙" in report
 
 
+def test_consolidate_reclassifies_ownership_when_independent_documents_collide(monkeypatch, tmp_path):
+    module = load_module(monkeypatch, tmp_path)
+    context = module.resolve_docs_contexts()[0]
+    first = context.adr_dir / "ADR-0001-existing.md"
+    second = context.adr_dir / "ADR-0002-independent.md"
+    write_adr(first, contracts=[{"id": "device.shared", "role": "producer"}])
+    write_adr(second, id="ADR-0002", title="Independent", contracts=[{"id": "device.shared", "role": "producer"}])
+    catalog = module.catalog_existing_adrs(context)
+    monkeypatch.setattr(
+        module,
+        "call_openai_json_object",
+        lambda *args, **kwargs: {
+            "merge": False,
+            "same_authoritative_boundary": False,
+            "same_validation_responsibility": False,
+            "independent_lifecycle": True,
+            "independent_rollback": True,
+            "ownership_updates": [
+                {
+                    "adr_id": "ADR-0001",
+                    "owns": [{"type": "runtime", "key": "device.read"}],
+                    "contracts": [{"id": "device.read", "role": "producer"}],
+                },
+                {
+                    "adr_id": "ADR-0002",
+                    "owns": [{"type": "runtime", "key": "device.write"}],
+                    "contracts": [{"id": "device.write", "role": "producer"}],
+                },
+            ],
+        },
+    )
+
+    changed = module.consolidate_context({"consolidate": "prompt"}, context, catalog, [])
+
+    assert changed
+    assert module.validate_catalog(module.catalog_existing_adrs(context), require_ownership=True) == []
+
+
 def test_catalog_validation_rejects_missing_and_duplicate_ownership(monkeypatch, tmp_path):
     module = load_module(monkeypatch, tmp_path)
     catalog = [
