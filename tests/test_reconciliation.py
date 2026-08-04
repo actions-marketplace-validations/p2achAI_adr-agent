@@ -11,7 +11,11 @@ MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "adr2_agent_acti
 
 
 def load_module(monkeypatch, tmp_path):
-    monkeypatch.setitem(sys.modules, "anthropic", types.SimpleNamespace(Anthropic=object, APIError=Exception))
+    monkeypatch.setitem(
+        sys.modules,
+        "anthropic",
+        types.SimpleNamespace(Anthropic=object, APIError=Exception, APIConnectionError=ConnectionError),
+    )
     monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=object, OpenAIError=Exception))
     monkeypatch.setenv("ADR2_REPO_ROOT", str(tmp_path))
     spec = importlib.util.spec_from_file_location("adr2_agent_action", MODULE_PATH)
@@ -20,6 +24,43 @@ def load_module(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "adr2_agent_action", module)
     spec.loader.exec_module(module)
     return module
+
+
+def test_claude_retries_connection_errors(monkeypatch, tmp_path):
+    module = load_module(monkeypatch, tmp_path)
+    calls = 0
+    sleeps = []
+
+    class Stream:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def get_final_message(self):
+            return types.SimpleNamespace(content=[types.SimpleNamespace(type="text", text="ok")])
+
+    class Messages:
+        def stream(self, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls < 3:
+                raise ConnectionError("temporary")
+            return Stream()
+
+    monkeypatch.setattr(
+        module,
+        "get_anthropic_client",
+        lambda: types.SimpleNamespace(messages=Messages()),
+    )
+    monkeypatch.setattr(module.time, "sleep", sleeps.append)
+
+    result = module.call_claude_text(model="claude", messages=[{"role": "user", "content": "hi"}])
+
+    assert result == "ok"
+    assert calls == 3
+    assert sleeps == [1, 2]
 
 
 def write_adr(path, **overrides):

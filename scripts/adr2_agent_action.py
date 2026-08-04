@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -638,11 +639,22 @@ def call_claude_text(
     if system:
         create_kwargs["system"] = system
 
-    try:
-        with client.messages.stream(**create_kwargs) as stream:
-            final_message = stream.get_final_message()
-    except anthropic.APIError as exc:
-        raise RuntimeError(f"Anthropic API call failed: {exc}") from exc
+    for attempt in range(5):
+        try:
+            with client.messages.stream(**create_kwargs) as stream:
+                final_message = stream.get_final_message()
+            break
+        except anthropic.APIConnectionError as exc:
+            if attempt == 4:
+                cause = repr(exc.__cause__) if exc.__cause__ else "unknown"
+                raise RuntimeError(
+                    f"Anthropic API connection failed after 5 attempts: {cause}"
+                ) from exc
+            delay = 2**attempt
+            log(f"Anthropic connection failed; retrying in {delay}s ({attempt + 1}/5).")
+            time.sleep(delay)
+        except anthropic.APIError as exc:
+            raise RuntimeError(f"Anthropic API call failed: {exc}") from exc
 
     text_blocks = [block.text for block in final_message.content if block.type == "text"]
     return "".join(text_blocks)
