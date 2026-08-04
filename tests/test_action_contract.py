@@ -29,6 +29,8 @@ def test_direct_publish_is_index_only_and_does_not_create_pr():
     assert "direct" in validation["run"]
     assert "index" in validation["run"]
     assert "inputs.publish_mode == 'direct'" in prepare_base["if"]
+    assert prepare_base["env"]["ADR2_GITHUB_TOKEN"] == "${{ inputs.github_token || github.token }}"
+    assert "http.https://github.com/.extraheader" in prepare_base["run"]
     assert 'git checkout --detach "origin/$ADR2_PR_BASE"' in prepare_base["run"]
     assert "inputs.publish_mode == 'direct'" in direct["if"]
     assert "inputs.operation == 'index'" in direct["if"]

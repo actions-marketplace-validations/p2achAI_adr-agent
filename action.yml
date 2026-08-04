@@ -91,10 +91,14 @@ runs:
       if: inputs.publish_mode == 'direct'
       shell: bash
       env:
+        ADR2_GITHUB_TOKEN: ${{ inputs.github_token || github.token }}
         ADR2_PR_BASE: ${{ inputs.pr_base || github.event.repository.default_branch }}
       run: |
         set -euo pipefail
-        git fetch origin "$ADR2_PR_BASE"
+        auth_header="$(printf 'x-access-token:%s' "$ADR2_GITHUB_TOKEN" | base64 | tr -d '\n')"
+        echo "::add-mask::$auth_header"
+        git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth_header" \
+          fetch origin "$ADR2_PR_BASE"
         git checkout --detach "origin/$ADR2_PR_BASE"
 
     - name: Set up Python
