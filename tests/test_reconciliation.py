@@ -63,6 +63,21 @@ def test_claude_retries_connection_errors(monkeypatch, tmp_path):
     assert sleeps == [1, 2]
 
 
+def test_anthropic_api_key_is_trimmed(monkeypatch, tmp_path):
+    module = load_module(monkeypatch, tmp_path)
+    received = {}
+    client = object()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key\n")
+    monkeypatch.setattr(
+        module.anthropic,
+        "Anthropic",
+        lambda **kwargs: received.update(kwargs) or client,
+    )
+
+    assert module.get_anthropic_client() is client
+    assert received == {"api_key": "test-key"}
+
+
 def write_adr(path, **overrides):
     meta = {
         "id": "ADR-0001",

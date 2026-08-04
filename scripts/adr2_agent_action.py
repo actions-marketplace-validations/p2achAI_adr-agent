@@ -526,7 +526,7 @@ def get_openai_client() -> OpenAI:
 def get_anthropic_client() -> anthropic.Anthropic:
     global _ANTHROPIC_CLIENT
     if _ANTHROPIC_CLIENT is None:
-        _ANTHROPIC_CLIENT = anthropic.Anthropic()
+        _ANTHROPIC_CLIENT = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"].strip())
     return _ANTHROPIC_CLIENT
 
 
