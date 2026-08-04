@@ -22,11 +22,14 @@ def test_publish_mode_defaults_to_pull_request():
 
 def test_direct_publish_is_index_only_and_does_not_create_pr():
     validation = _step("Validate publish mode")
+    prepare_base = _step("Prepare direct publish base")
     direct = _step("Publish index directly")
     create_pr = _step("Create PR if changes")
 
     assert "direct" in validation["run"]
     assert "index" in validation["run"]
+    assert "inputs.publish_mode == 'direct'" in prepare_base["if"]
+    assert 'git checkout --detach "origin/$ADR2_PR_BASE"' in prepare_base["run"]
     assert "inputs.publish_mode == 'direct'" in direct["if"]
     assert "inputs.operation == 'index'" in direct["if"]
     assert 'push origin "HEAD:${ADR2_PR_BASE}"' in direct["run"]
