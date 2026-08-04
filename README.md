@@ -132,9 +132,10 @@ ADR 2.0 is the natural evolution of architecture documentation in an AI-native d
 ### Inputs
 - `operation` (optional, default `reconcile`): `reconcile` updates an existing ADR before creating a new one, `consolidate` backfills ownership and merges judged duplicates, and `index` deterministically regenerates indexes without an LLM key
 - `require_ownership` (optional, default `false`): reject missing ownership/domain metadata and catalog conflicts
+- `publish_mode` (optional, default `pull-request`): `pull-request` opens a bot PR, `direct` commits an `index` result to the base branch, and `none` only validates/generates in the workspace
 - `openai_api_key` (required for `reconcile` and `consolidate` with OpenAI): OpenAI API key
 - `openai_model` (optional, default `gpt-5.1`): model name
-- `github_token` (required): token to open PR (PAT with repo write/PR write recommended; GITHUB_TOKEN may be insufficient in some orgs)
+- `github_token` (required): token to open a PR or directly push an index (PAT with repo write/PR write recommended; GITHUB_TOKEN may be insufficient in some orgs)
 - `pr_branch` (optional, default `adr/auto-update`): branch for ADR PR
 - `pr_title` (optional, default `chore: ADR auto-update`): PR title/commit message
 - `pr_body` (optional): PR body

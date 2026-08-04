@@ -9,6 +9,10 @@ inputs:
     description: "Fail when active ADRs lack valid ownership/domain metadata"
     required: false
     default: "false"
+  publish_mode:
+    description: "How to publish changes: pull-request, direct, or none. Direct is index-only."
+    required: false
+    default: "pull-request"
   llm_provider:
     description: "LLM provider to use: 'openai' or 'claude'"
     required: false
@@ -63,6 +67,26 @@ inputs:
 runs:
   using: "composite"
   steps:
+    - name: Validate publish mode
+      shell: bash
+      env:
+        ADR2_OPERATION: ${{ inputs.operation }}
+        ADR2_PUBLISH_MODE: ${{ inputs.publish_mode }}
+      run: |
+        case "$ADR2_PUBLISH_MODE" in
+          pull-request|none) ;;
+          direct)
+            if [ "$ADR2_OPERATION" != "index" ]; then
+              echo "publish_mode=direct is only supported for operation=index" >&2
+              exit 1
+            fi
+            ;;
+          *)
+            echo "publish_mode must be pull-request, direct, or none" >&2
+            exit 1
+            ;;
+        esac
+
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
@@ -119,6 +143,7 @@ runs:
         done
 
     - name: Stage changed docs paths
+      if: inputs.publish_mode != 'none'
       shell: bash
       env:
         ADR2_ADD_PATHS: ${{ inputs.add_paths }}
@@ -138,7 +163,38 @@ runs:
           git add -A -- "$pattern" 2>/dev/null || true
         done <<< "$ADR2_ADD_PATHS"
 
+    - name: Publish index directly
+      if: inputs.publish_mode == 'direct' && inputs.operation == 'index'
+      shell: bash
+      env:
+        ADR2_GITHUB_TOKEN: ${{ inputs.github_token || github.token }}
+        ADR2_PR_BASE: ${{ inputs.pr_base || github.event.repository.default_branch }}
+        ADR2_COMMIT_MESSAGE: ${{ inputs.pr_title }}
+      run: |
+        set -euo pipefail
+
+        if git diff --cached --quiet; then
+          echo "No index changes to publish."
+          exit 0
+        fi
+
+        git fetch origin "$ADR2_PR_BASE"
+        if [ "$(git rev-parse HEAD)" != "$(git rev-parse "origin/$ADR2_PR_BASE")" ]; then
+          echo "Base branch advanced while generating the index; rerun the workflow." >&2
+          exit 1
+        fi
+
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git commit -m "$ADR2_COMMIT_MESSAGE"
+
+        auth_header="$(printf 'x-access-token:%s' "$ADR2_GITHUB_TOKEN" | base64 | tr -d '\n')"
+        echo "::add-mask::$auth_header"
+        git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth_header" \
+          push origin "HEAD:${ADR2_PR_BASE}"
+
     - name: Create PR if changes
+      if: inputs.publish_mode == 'pull-request'
       uses: peter-evans/create-pull-request@v6
       with:
         token: ${{ inputs.github_token || github.token }}
