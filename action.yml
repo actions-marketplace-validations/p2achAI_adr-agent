@@ -97,8 +97,11 @@ runs:
         set -euo pipefail
         auth_header="$(printf 'x-access-token:%s' "$ADR2_GITHUB_TOKEN" | base64 | tr -d '\n')"
         echo "::add-mask::$auth_header"
-        git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth_header" \
-          fetch origin "$ADR2_PR_BASE"
+        git_with_auth() {
+          git -c "http.https://github.com/.extraheader=" \
+            -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth_header" "$@"
+        }
+        git_with_auth fetch origin "$ADR2_PR_BASE"
         git checkout --detach "origin/$ADR2_PR_BASE"
 
     - name: Set up Python
@@ -187,12 +190,19 @@ runs:
       run: |
         set -euo pipefail
 
+        auth_header="$(printf 'x-access-token:%s' "$ADR2_GITHUB_TOKEN" | base64 | tr -d '\n')"
+        echo "::add-mask::$auth_header"
+        git_with_auth() {
+          git -c "http.https://github.com/.extraheader=" \
+            -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth_header" "$@"
+        }
+
         if git diff --cached --quiet; then
           echo "No index changes to publish."
           exit 0
         fi
 
-        git fetch origin "$ADR2_PR_BASE"
+        git_with_auth fetch origin "$ADR2_PR_BASE"
         if [ "$(git rev-parse HEAD)" != "$(git rev-parse "origin/$ADR2_PR_BASE")" ]; then
           echo "Base branch advanced while generating the index; rerun the workflow." >&2
           exit 1
@@ -202,10 +212,7 @@ runs:
         git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
         git commit -m "$ADR2_COMMIT_MESSAGE"
 
-        auth_header="$(printf 'x-access-token:%s' "$ADR2_GITHUB_TOKEN" | base64 | tr -d '\n')"
-        echo "::add-mask::$auth_header"
-        git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth_header" \
-          push origin "HEAD:${ADR2_PR_BASE}"
+        git_with_auth push origin "HEAD:${ADR2_PR_BASE}"
 
     - name: Create PR if changes
       if: inputs.publish_mode == 'pull-request'

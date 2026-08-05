@@ -38,6 +38,17 @@ def test_direct_publish_is_index_only_and_does_not_create_pr():
     assert "inputs.publish_mode == 'pull-request'" in create_pr["if"]
 
 
+def test_direct_publish_owns_git_auth_for_every_remote_operation():
+    prepare_base = _step("Prepare direct publish base")["run"]
+    direct = _step("Publish index directly")["run"]
+
+    assert 'git -c "http.https://github.com/.extraheader="' in prepare_base
+    assert 'git -c "http.https://github.com/.extraheader="' in direct
+    assert 'git_with_auth fetch origin "$ADR2_PR_BASE"' in prepare_base
+    assert 'git_with_auth fetch origin "$ADR2_PR_BASE"' in direct
+    assert 'git_with_auth push origin "HEAD:${ADR2_PR_BASE}"' in direct
+
+
 def test_validation_mode_generates_without_staging_or_publishing():
     stage = _step("Stage changed docs paths")
     create_pr = _step("Create PR if changes")
