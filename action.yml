@@ -1,13 +1,36 @@
-name: "ADR 2.0 Agent Promotion"
-description: "Promote AARs under docs/aar/ to ADRs under docs/adr/, update index.json (agent-friendly)."
+name: "ADR 2.0 Reconciliation"
+description: "Reconcile AARs with existing ADRs, consolidate duplicates, or deterministically generate indexes."
 inputs:
+  operation:
+    description: "Operation to run: reconcile, consolidate, or index"
+    required: false
+    default: "reconcile"
+  require_ownership:
+    description: "Fail when active ADRs lack valid ownership/domain metadata"
+    required: false
+    default: "false"
+  publish_mode:
+    description: "How to publish changes: pull-request, direct, or none. Direct is index-only."
+    required: false
+    default: "pull-request"
+  llm_provider:
+    description: "LLM provider to use: 'openai' or 'claude'"
+    required: false
+    default: "openai"
   openai_api_key:
-    description: "OpenAI API key"
-    required: true
+    description: "OpenAI API key (required when llm_provider=openai)"
+    required: false
   openai_model:
     description: "OpenAI model name"
     required: false
     default: "gpt-5.1"
+  anthropic_api_key:
+    description: "Anthropic API key (required when llm_provider=claude)"
+    required: false
+  claude_model:
+    description: "Claude model name"
+    required: false
+    default: "claude-sonnet-4-6"
   github_token:
     description: "GitHub token for creating PRs (PAT recommended; GITHUB_TOKEN may be insufficient in some orgs)"
     required: true
@@ -26,6 +49,17 @@ inputs:
   pr_base:
     description: "Base branch for the PR (optional; defaults to repo default)"
     required: false
+  reviewers:
+    description: "Comma or newline separated GitHub usernames to request as PR reviewers"
+    required: false
+  docs_dirs:
+    description: "Comma or newline separated docs directories to process. Each directory must contain aar/ and adr/. Defaults to docs"
+    required: false
+    default: "docs"
+  add_paths:
+    description: "Paths passed to create-pull-request add-paths"
+    required: false
+    default: "docs/**"
   language:
     description: "Language to generate ADRs (e.g., en, ko); default en"
     required: false
@@ -33,6 +67,43 @@ inputs:
 runs:
   using: "composite"
   steps:
+    - name: Validate publish mode
+      shell: bash
+      env:
+        ADR2_OPERATION: ${{ inputs.operation }}
+        ADR2_PUBLISH_MODE: ${{ inputs.publish_mode }}
+      run: |
+        case "$ADR2_PUBLISH_MODE" in
+          pull-request|none) ;;
+          direct)
+            if [ "$ADR2_OPERATION" != "index" ]; then
+              echo "publish_mode=direct is only supported for operation=index" >&2
+              exit 1
+            fi
+            ;;
+          *)
+            echo "publish_mode must be pull-request, direct, or none" >&2
+            exit 1
+            ;;
+        esac
+
+    - name: Prepare direct publish base
+      if: inputs.publish_mode == 'direct'
+      shell: bash
+      env:
+        ADR2_GITHUB_TOKEN: ${{ inputs.github_token || github.token }}
+        ADR2_PR_BASE: ${{ inputs.pr_base || github.event.repository.default_branch }}
+      run: |
+        set -euo pipefail
+        auth_header="$(printf 'x-access-token:%s' "$ADR2_GITHUB_TOKEN" | base64 | tr -d '\n')"
+        echo "::add-mask::$auth_header"
+        git_with_auth() {
+          git -c "http.https://github.com/.extraheader=" \
+            -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth_header" "$@"
+        }
+        git_with_auth fetch origin "$ADR2_PR_BASE"
+        git checkout --detach "origin/$ADR2_PR_BASE"
+
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
@@ -47,26 +118,111 @@ runs:
     - name: Generate ADRs from AARs
       shell: bash
       env:
+        ADR2_OPERATION: ${{ inputs.operation }}
+        ADR2_REQUIRE_OWNERSHIP: ${{ inputs.require_ownership }}
+        LLM_PROVIDER: ${{ inputs.llm_provider }}
         OPENAI_API_KEY: ${{ inputs.openai_api_key }}
         OPENAI_MODEL: ${{ inputs.openai_model }}
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic_api_key }}
+        CLAUDE_MODEL: ${{ inputs.claude_model }}
         ADR2_REPO_ROOT: ${{ github.workspace }}
+        ADR2_DOCS_DIRS: ${{ inputs.docs_dirs }}
         ADR2_LANGUAGE: ${{ inputs.language }}
+        ADR2_PR_BODY_PATH: ${{ runner.temp }}/adr2-pr-body.md
       run: python "$GITHUB_ACTION_PATH/scripts/adr2_agent_action.py"
 
-    - name: Show ADR index
+    - name: Prepare PR body
+      id: pr_body
+      shell: bash
+      env:
+        ADR2_DEFAULT_PR_BODY: ${{ inputs.pr_body }}
+        ADR2_PR_BODY_PATH: ${{ runner.temp }}/adr2-pr-body.md
+      run: |
+        {
+          echo 'body<<ADR2_BODY'
+          if [ -f "$ADR2_PR_BODY_PATH" ]; then cat "$ADR2_PR_BODY_PATH"; else printf '%s\n' "$ADR2_DEFAULT_PR_BODY"; fi
+          echo 'ADR2_BODY'
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Show ADR indexes
       if: always()
       shell: bash
-      run: test -f docs/adr/index.json && cat docs/adr/index.json || echo "index.json not created"
+      env:
+        ADR2_DOCS_DIRS: ${{ inputs.docs_dirs }}
+      run: |
+        set -euo pipefail
+
+        mapfile -t docs_dirs < <(printf '%s\n' "${ADR2_DOCS_DIRS:-docs}" | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sed '/^$/d')
+        for docs_dir in "${docs_dirs[@]}"; do
+          index_path="${docs_dir}/adr/index.json"
+          echo "### ${index_path}"
+          test -f "${index_path}" && cat "${index_path}" || echo "index.json not created"
+        done
+
+    - name: Stage changed docs paths
+      if: inputs.publish_mode != 'none'
+      shell: bash
+      env:
+        ADR2_ADD_PATHS: ${{ inputs.add_paths }}
+      run: |
+        set -euo pipefail
+
+        # peter-evans/create-pull-request's add-paths passes every pattern to
+        # a single `git add -- <pattern1> <pattern2> ...` call, and git aborts
+        # that entire call the moment ANY one pattern matches zero paths (e.g.
+        # an app's docs/aar/ is empty because every AAR was just consumed).
+        # That would throw away staging for patterns that DID match too.
+        # Stage each pattern independently here, tolerating zero-match
+        # patterns individually, then omit add-paths below so the PR step
+        # just picks up whatever is already staged.
+        while IFS= read -r pattern; do
+          [ -z "$pattern" ] && continue
+          git add -A -- "$pattern" 2>/dev/null || true
+        done <<< "$ADR2_ADD_PATHS"
+
+    - name: Publish index directly
+      if: inputs.publish_mode == 'direct' && inputs.operation == 'index'
+      shell: bash
+      env:
+        ADR2_GITHUB_TOKEN: ${{ inputs.github_token || github.token }}
+        ADR2_PR_BASE: ${{ inputs.pr_base || github.event.repository.default_branch }}
+        ADR2_COMMIT_MESSAGE: ${{ inputs.pr_title }}
+      run: |
+        set -euo pipefail
+
+        auth_header="$(printf 'x-access-token:%s' "$ADR2_GITHUB_TOKEN" | base64 | tr -d '\n')"
+        echo "::add-mask::$auth_header"
+        git_with_auth() {
+          git -c "http.https://github.com/.extraheader=" \
+            -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth_header" "$@"
+        }
+
+        if git diff --cached --quiet; then
+          echo "No index changes to publish."
+          exit 0
+        fi
+
+        git_with_auth fetch origin "$ADR2_PR_BASE"
+        if [ "$(git rev-parse HEAD)" != "$(git rev-parse "origin/$ADR2_PR_BASE")" ]; then
+          echo "Base branch advanced while generating the index; rerun the workflow." >&2
+          exit 1
+        fi
+
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git commit -m "$ADR2_COMMIT_MESSAGE"
+
+        git_with_auth push origin "HEAD:${ADR2_PR_BASE}"
 
     - name: Create PR if changes
+      if: inputs.publish_mode == 'pull-request'
       uses: peter-evans/create-pull-request@v6
       with:
         token: ${{ inputs.github_token || github.token }}
         commit-message: ${{ inputs.pr_title }}
         branch: ${{ inputs.pr_branch }}
         title: ${{ inputs.pr_title }}
-        body: ${{ inputs.pr_body }}
+        body: ${{ steps.pr_body.outputs.body }}
         base: ${{ inputs.pr_base }}
         delete-branch: true
-        add-paths: |
-          docs/**
+        reviewers: ${{ inputs.reviewers }}

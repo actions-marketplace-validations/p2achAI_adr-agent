@@ -126,23 +126,30 @@ ADR 2.0 is the natural evolution of architecture documentation in an AI-native d
 
 ### Summary
 - Name: ADR 2.0 Agent Promotion
-- Purpose: detect AARs under `docs/aar/`, promote to ADRs under `docs/adr/ADR-XXXX-*.md`, update `docs/adr/index.json`, and clean up processed AARs
+- Purpose: detect AARs under configured `docs/aar/` directories, promote to ADRs under each paired `docs/adr/ADR-XXXX-*.md`, update each `docs/adr/index.json`, and clean up processed AARs
 - Features: agent-friendly template (Agent Playbook, Agent Signals, Validation Rules), slim index, progress logs, automatic AAR cleanup
 
 ### Inputs
-- `openai_api_key` (required): OpenAI API key
+- `operation` (optional, default `reconcile`): `reconcile` updates an existing ADR before creating a new one, `consolidate` backfills ownership and merges judged duplicates, and `index` deterministically regenerates indexes without an LLM key
+- `require_ownership` (optional, default `false`): reject missing ownership/domain metadata and catalog conflicts
+- `publish_mode` (optional, default `pull-request`): `pull-request` opens a bot PR, `direct` commits an `index` result to the base branch, and `none` only validates/generates in the workspace
+- `openai_api_key` (required for `reconcile` and `consolidate` with OpenAI): OpenAI API key
 - `openai_model` (optional, default `gpt-5.1`): model name
-- `github_token` (required): token to open PR (PAT with repo write/PR write recommended; GITHUB_TOKEN may be insufficient in some orgs)
+- `github_token` (required): token to open a PR or directly push an index (PAT with repo write/PR write recommended; GITHUB_TOKEN may be insufficient in some orgs)
 - `pr_branch` (optional, default `adr/auto-update`): branch for ADR PR
 - `pr_title` (optional, default `chore: ADR auto-update`): PR title/commit message
 - `pr_body` (optional): PR body
 - `pr_base` (optional): base branch (defaults to repo default)
+- `reviewers` (optional): comma or newline separated GitHub usernames to request as PR reviewers
+- `docs_dirs` (optional, default `docs`): comma or newline separated docs directories to process. Each directory must contain `aar/` and `adr/`
+- `add_paths` (optional, default `docs/**`): paths passed to `create-pull-request` `add-paths`
 - `language` (optional, default `en`): ADR output language (not stored in front matter; applies to generated text)
 
 ### Permissions
 ```yaml
 permissions:
   contents: write
+  pull-requests: write
 ```
 
 ### Example workflow (`.github/workflows/adr.yaml`)
@@ -163,29 +170,37 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: p2achAI/adr-agent@v1  # pin tag/commit
+      - uses: p2achAI/adr-agent@v2.0.0
         with:
+          operation: reconcile
           openai_api_key: ${{ secrets.OPENAI_API_KEY }}
           openai_model: gpt-5.1
           pr_branch: adr/auto-${{ github.run_id }}
           pr_title: chore: ADR auto-update (#${{ github.run_number }})
           pr_body: Automated ADR updates generated from AARs.
+          reviewers: JuHyung-Son
+          docs_dirs: |
+            apps/backend/docs
+            apps/frontend/docs
+          add_paths: |
+            apps/**/docs/adr/**
+            apps/**/docs/aar/**
 ```
 
 ### Flow
-1) Scan `docs/aar/` → detect candidates  
-2) Generate ADRs (`docs/adr/ADR-XXXX-<slug>.md` with front matter `id/scope/created_at/updated_at/decision/context/rationale/alternatives/consequences/related/validation_rules/agent_playbook/agent_signals/index_terms`)  
-3) Update slim `docs/adr/index.json` (with `decision_summary`)  
-4) Delete promoted AARs and non-candidates  
-5) Open PR with the ADR/cleanup changes (skipped if no changes)  
-6) ADR content generated in the selected `language` (front matter only; no duplicated markdown body)
+1) `reconcile`: compare each AAR with a bounded existing-ADR shortlist and choose `covered`, `amend`, `create`, `reject`, or `defer`
+2) `consolidate`: backfill `owns/contracts/applies_to`, judge exact ownership collisions, and move merged duplicates under `docs/adr/superseded/`
+3) `index`: rebuild schema-v2 `index.json` from active ADR front matter without an LLM key
+4) Open a reviewable PR with changed paths; the action never merges its own PR
 
 ### Environment
 - `ADR2_REPO_ROOT` is auto-set to `github.workspace` so the action runs against the calling repo.
+- `ADR2_DOCS_DIRS` is auto-set from `docs_dirs`.
 
 ### Caution
-- AAR source files under `docs/aar/` are deleted after processing; back them up elsewhere if you need to keep originals.
+- `defer` keeps the AAR. `covered`, `amend`, `create`, and `reject` remove it only in the generated PR.
 
 ### ADR output (agent-friendly)
-- Front matter (YAML between `---`): `id`, `scope`, `created_at`, `updated_at`, `decision`, `context`, `rationale`, `alternatives`, `consequences`, `related`, `validation_rules`, `agent_playbook`, `agent_signals`(importance/enforcement), `index_terms`
+- Front matter (YAML between `---`): existing v1 fields plus `owns`, `contracts`, `applies_to`, and typed `relations`. Top-level `related` remains readable during v2 migration.
+- Index: deterministic schema v2 with `schema_version`, `source_hash`, ownership/contract/relation/rule metadata. Set `require_ownership: true` after backfill to reject missing ownership, invalid domains, broken relations, and duplicate producers.
 - Body: `## Context (for humans)` with the same context text (minimal human-readable section)
